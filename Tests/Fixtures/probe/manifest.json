@@ -1,0 +1,1 @@
+{"manifest_version":3,"name":"Drift Probe","version":"1.0","description":"Test fixture: checks a page's script can reach its background page and be recognised as a tab.","background":{"service_worker":"background.js"},"permissions":["tabs","storage"],"host_permissions":["<all_urls>"],"content_scripts":[{"matches":["<all_urls>"],"js":["content.js"],"run_at":"document_start"}]}
