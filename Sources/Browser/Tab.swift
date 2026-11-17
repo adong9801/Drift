@@ -337,6 +337,20 @@ final class Tab: NSObject, ObservableObject, Identifiable {
         inspector.perform(Selector(("show")))
     }
 
+    /// Leaving in-window full screen restores the web view's first-responder
+    /// status, but not the focused DOM element — so a player like YouTube's,
+    /// which binds its space/arrow keys to the player, stays deaf until the
+    /// video is clicked. Focus the player in the page too, which a click would.
+    func restorePageKeyboardFocus() {
+        guard let webView else { return }
+        webView.window?.makeFirstResponder(webView)
+        // Focus the player in the page too, which a click would: a player like
+        // YouTube's binds its space/arrow keys to itself and stays deaf until
+        // something inside it is focused.
+        let js = "(function(){var v=document.querySelector('video');if(!v)return;var p=v.closest('[tabindex]')||v;try{p.focus({preventScroll:true});}catch(e){}})()"
+        webView.evaluateJavaScript(js, in: nil, in: .page) { _ in }
+    }
+
     func focus() {
         guard let webView else { return }
         webView.window?.makeFirstResponder(webView)
@@ -610,6 +624,36 @@ final class PageView: WKWebView {
         guard !items.isEmpty else { return }
         menu.addItem(.separator())
         items.forEach(menu.addItem)
+    }
+
+    // WebKit tracks the pointer with an NSTrackingArea scoped to the key window
+    // (`.activeInKeyWindow`) and no longer forwards mouseMoved to the view, so
+    // that area is the only thing that drives the page's `:hover`. The effect:
+    // a video's controls (YouTube's bar) never appear when you hover while Drift
+    // is not the active window — intermittent, since it depends on which window
+    // is key. Safari-like browsers broaden that area to stay active always; do
+    // the same, every time WebKit rebuilds its tracking (on resize, re-parent,
+    // navigation). Owner and userInfo are kept, so WebKit still gets the moves.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        // After WebKit has rebuilt its own areas for this layout pass.
+        DispatchQueue.main.async { [weak self] in self?.widenHoverTracking() }
+    }
+
+    private func widenHoverTracking() {
+        func widen(_ view: NSView) {
+            for area in view.trackingAreas
+            where area.options.contains(.mouseMoved) && area.options.contains(.activeInKeyWindow) {
+                view.removeTrackingArea(area)
+                view.addTrackingArea(NSTrackingArea(
+                    rect: area.rect,
+                    options: area.options.subtracting(.activeInKeyWindow).union(.activeAlways),
+                    owner: area.owner,
+                    userInfo: area.userInfo))
+            }
+            view.subviews.forEach(widen)
+        }
+        widen(self)
     }
 }
 

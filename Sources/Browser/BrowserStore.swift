@@ -230,11 +230,36 @@ final class BrowserStore: ObservableObject {
             }
         } else if fullscreenTab === tab {
             fullscreenTab = nil
+            // Coming out of full screen re-parents the page's web view into the
+            // framed layout, and re-parenting an NSView drops its first-responder
+            // status — so the page stops getting keystrokes (a video's space,
+            // arrow keys, j/k/l) until it is clicked. Hand focus back.
             if windowFullScreenForPage {
                 windowFullScreenForPage = false
+                // The window is also animating out of macOS full screen, and it
+                // resets the first responder when that finishes — so focusing now
+                // would not stick. Wait for the exit to complete (see
+                // windowDidExitFullScreen).
+                focusAfterWindowExit = tab
                 if let window, window.styleMask.contains(.fullScreen) { window.toggleFullScreen(nil) }
+            } else {
+                // No window transition: restore focus once the view has settled.
+                DispatchQueue.main.async { tab.restorePageKeyboardFocus() }
             }
         }
+    }
+
+    /// The tab whose page just left full screen, waiting for the window to
+    /// finish animating out of macOS full screen before it is given focus back.
+    private var focusAfterWindowExit: Tab?
+
+    /// The window has finished leaving macOS full screen. If a page just left
+    /// full screen with it, the page's web view can take focus again now that
+    /// the window has stopped resetting the first responder.
+    func windowDidExitFullScreen() {
+        guard let tab = focusAfterWindowExit else { return }
+        focusAfterWindowExit = nil
+        DispatchQueue.main.async { tab.restorePageKeyboardFocus() }
     }
 
     /// The window is leaving full screen by the user's hand: the page comes
@@ -588,6 +613,10 @@ final class BrowserStore: ObservableObject {
         }
         tab.sleep()
 
+        // Whether closing this tab hands the screen to a different one, which
+        // should then pull its video back out of Picture in Picture.
+        let closingSelected = selectedID == tab.id
+
         if tab.id == splitID {
             splitID = nil
             focusedPane = .primary
@@ -602,6 +631,12 @@ final class BrowserStore: ObservableObject {
                 selectedID = next
                 if let next { recent.touch(next) }
             }
+        }
+        // The tab now on screen returns from Picture in Picture, as selecting
+        // it would — close() sets selectedID directly, bypassing select(), so
+        // the same thing has to be done here.
+        if closingSelected, PictureInPicture.automatic, let now = focused {
+            now.pictureInPicture(.tabShown)
         }
         sessionChanged()
         if let now = focused { DispatchQueue.main.async { now.focus() } }

@@ -134,6 +134,16 @@ struct WindowButtons: NSViewRepresentable {
                     MainActor.assumeIsolated { self?.place() }
                 }
             }
+            // When the window finishes leaving macOS full screen, a page that
+            // left full screen with it takes keyboard focus back (see
+            // BrowserStore.windowDidExitFullScreen).
+            watching.append(
+                NotificationCenter.default.addObserver(
+                    forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main
+                ) { _ in
+                    MainActor.assumeIsolated { store.windowDidExitFullScreen() }
+                }
+            )
             DispatchQueue.main.async { [weak self] in self?.place() }
         }
 
