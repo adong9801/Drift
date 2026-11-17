@@ -1,8 +1,8 @@
 import Foundation
 
-/// Taking the edge off a white page arriving in a dark room: tab switches
-/// cross-fade rather than cut, and bright pages are veiled a little when the
-/// system is in dark mode, so the eye is not asked to jump between extremes.
+/// Taking the edge off a white page arriving in a dark room: bright pages are
+/// veiled a little when the system is in dark mode, so the eye is not asked to
+/// jump between extremes.
 enum EyeComfort {
 
     private static let dimKey = "drift.dimBrightPages.v1"
@@ -13,11 +13,6 @@ enum EyeComfort {
         get { UserDefaults.standard.object(forKey: dimKey) as? Bool ?? false }
         set { UserDefaults.standard.set(newValue, forKey: dimKey) }
     }
-
-    /// How long one page takes to give way to the next. Under a fifth of a
-    /// second reads as a cut; this is long enough to be felt as a fade and
-    /// short enough not to feel like waiting.
-    static let crossfade: TimeInterval = 0.3
 
     /// The veil's strength for a page of the given luminance, 0 to 1. Nothing
     /// for a dark page or in light surroundings; up to `strongest` for a white

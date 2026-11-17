@@ -13,7 +13,9 @@ struct FrameTint: View {
     let tab: Tab?
 
     var body: some View {
-        if let tab { Observed(tab: tab) } else { Design.chrome }
+        // One view per tab, so a switch changes colour at once; only a page
+        // changing its own colour as it loads fades.
+        if let tab { Observed(tab: tab).id(tab.id) } else { Design.chrome }
     }
 
     private struct Observed: View {
@@ -35,7 +37,7 @@ struct FrameCorners: View {
     var body: some View {
         // With the sidebar showing, the frame is glass, so the corners are cut
         // from the same glass.
-        if let tab { Observed(tab: tab) } else { VisualEffect(material: .underWindowBackground, cornersOnly: Design.pageRadius) }
+        if let tab { Observed(tab: tab).id(tab.id) } else { VisualEffect(material: .underWindowBackground, cornersOnly: Design.pageRadius) }
     }
 
     private struct Observed: View {

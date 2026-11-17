@@ -108,6 +108,16 @@ do {
     check("so does typing on past it",
           Suggest.build(input: "calendar", tabs: tabs, history: history, learned: learned, now: now).first?.action == .open(calendar))
     check("unrelated text does not", !Suggest.build(input: "swift", tabs: tabs, history: history, learned: learned, now: now).contains { $0.kind == .learned })
+    var docs = Shortcuts()
+    let googleDocs = URL(string: "https://docs.google.com/document/u/0/")!
+    for _ in 0..<5 { docs.learn(typed: "do", url: googleDocs, title: "Google Docs", now: now) }
+    check("typing on past a short shortcut into the page's name still finds it",
+          Suggest.build(input: "docs", tabs: tabs, history: history, learned: docs, now: now).first?.action == .open(googleDocs))
+    check("but a question that merely starts with it is searched", {
+        let rows = Suggest.build(input: "does sophia die in lupin", tabs: tabs, history: history, learned: docs, now: now)
+        return rows.first?.kind == .search && !rows.contains { $0.kind == .learned }
+    }())
+    check("as is a word that only starts the same", Suggest.build(input: "dog", tabs: tabs, history: history, learned: docs, now: now).first?.kind == .search)
     check("a typed address still wins over memory",
           Suggest.build(input: "cal.example.org", tabs: tabs, history: history, learned: learned, now: now).first?.kind == .address)
     check("memory beats the history guess for the same letters", {

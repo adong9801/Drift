@@ -50,7 +50,8 @@ struct BrowserWindow: View {
                 // the bar and frame take the page's own colour.
                 VStack(spacing: 0) {
                     if let tab = store.focused {
-                        TopBar(tab: tab, store: store)
+                        // Per tab, like `FrameTint`: a switch is a cut.
+                        TopBar(tab: tab, store: store).id(tab.id)
                     } else {
                         Color.clear.frame(height: TopBar.height)
                     }
@@ -103,7 +104,7 @@ struct BrowserWindow: View {
             }
             if let notice = store.notice {
                 NoticeView(notice: notice, store: store)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .transition(.move(edge: .top).combined(with: .opacity))
                     .zIndex(4)
             }
         }
@@ -153,7 +154,7 @@ struct BrowserWindow: View {
         let framed = !store.isFullScreen || store.split != nil
         let radius = framed ? Design.pageRadius : 0
         return WebPane(tab: tab)
-            .overlay { PageVeil(tab: tab).allowsHitTesting(false) }
+            .overlay { PageVeil(tab: tab).id(tab.id).allowsHitTesting(false) }
             .background {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
                     .fill(Design.surface)
@@ -277,38 +278,47 @@ private struct PageVeil: View {
     }
 }
 
-/// "Opened behind: site" or "Link copied", bottom left, for a moment.
-/// Clicking it goes to the tab it is about, if it is about one.
+/// "Opened behind: site" or "Link copied", top right, for a moment: under
+/// the top bar when there is one, so its buttons stay clear. Clicking it goes
+/// to the tab it is about, if it is about one.
 private struct NoticeView: View {
     let notice: BrowserStore.Notice
     @ObservedObject var store: BrowserStore
 
+    /// The bar across the top is there when the sidebar is away, unless a
+    /// page has the whole window.
+    private var topInset: CGFloat {
+        if store.fullscreenTab != nil { return 0 }
+        return store.sidebarVisible ? Design.gutter : TopBar.height
+    }
+
     var body: some View {
         VStack {
-            Spacer()
             HStack {
+                Spacer()
                 Button {
                     store.dismissNotice()
                     if let id = notice.tabID, let tab = store.tab(id) { store.select(tab) }
                 } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: notice.symbol).font(.system(size: 12, weight: .semibold))
-                        Text(notice.text).font(Design.body(12, weight: .medium)).lineLimit(1)
+                    HStack(spacing: 10) {
+                        Image(systemName: notice.symbol).font(.system(size: 16, weight: .semibold))
+                        Text(notice.text).font(Design.body(15, weight: .semibold)).lineLimit(1)
                         if notice.tabID != nil {
-                            Text("Show").font(Design.body(12)).foregroundStyle(.white.opacity(0.6))
+                            Text("Show").font(Design.body(15)).foregroundStyle(.white.opacity(0.6))
                         }
                     }
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
-                    .background(Capsule().fill(Color.black.opacity(0.78)))
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 13)
+                    .background(Capsule().fill(Color.black.opacity(0.82)))
+                    .shadow(color: .black.opacity(0.25), radius: 12, y: 4)
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                Spacer()
             }
-            .padding(.leading, Design.gutter + 12)
-            .padding(.bottom, Design.gutter + 12)
+            .padding(.trailing, Design.gutter + 14)
+            .padding(.top, topInset + 14)
+            Spacer()
         }
     }
 }

@@ -88,6 +88,44 @@ MainActor.assumeIsolated {
     check("a thumbnail was taken for Ctrl-Tab", first.thumbnail != nil)
     shot("one-tab")
 
+    print("page fullscreen")
+    // A video inside an ancestor with a transform (and clipping) — how X
+    // virtualises its timeline, moving each cell with transform:translateY —
+    // used to trap the pinned fullscreen video in that small cell, so it never
+    // filled the window. The shim now strips transform/clip from ancestors on
+    // the way in. Exercises the real injected script via makeConfiguration.
+    let fsView = WKWebView(frame: CGRect(x: 0, y: 0, width: 1280, height: 800),
+                           configuration: Tab.makeConfiguration())
+    host.addSubview(fsView)
+    fsView.loadHTMLString("""
+    <!doctype html><html><body style='margin:0;height:100%'>
+    <div id=cell style='position:absolute;top:0;left:0;width:360px;height:220px;transform:translateY(120px);overflow:hidden'>
+      <video id=v style='width:320px;height:180px'></video></div>
+    <div id=plain style='position:absolute;top:460px;left:0;width:360px;height:220px;overflow:hidden'>
+      <video id=cv style='width:320px;height:180px'></video></div>
+    </body></html>
+    """, baseURL: URL(string: "https://example.test/")!)
+    // center of the 1280x800 view; a fullscreen video must own that point.
+    let fsMeasure = """
+    (function(){
+      var v=document.getElementById('v'); if(!v) return 'waiting';
+      function fills(el){try{el.requestFullscreen();}catch(e){}
+        var hit=document.elementFromPoint(640,400)===el;
+        try{document.exitFullscreen();}catch(e){} return hit;}
+      return JSON.stringify({x:fills(v), yt:fills(document.getElementById('cv')), done:true});
+    })()
+    """
+    var fsResult = ""
+    spin(10) {
+        fsView.evaluateJavaScript(fsMeasure) { v, _ in if let s = v as? String, s != "waiting" { fsResult = s } }
+        return fsResult.contains("done")
+    }
+    check("fullscreen fills the window through a transformed, clipped ancestor (X)",
+          fsResult.contains("\"x\":true"))
+    check("fullscreen still fills the window with no transformed ancestor (YouTube)",
+          fsResult.contains("\"yt\":true"))
+    fsView.removeFromSuperview()
+
     print("tabs")
     let second = store.newTab(URL(string: "https://www.iana.org/help/example-domains")!)
     spin(20) { !second.isLoading && !second.title.isEmpty }
@@ -524,17 +562,17 @@ MainActor.assumeIsolated {
     store.close(walker)
 
     print("waking a sleeping tab")
-    // A woken page fades in at once, as the window's colour until it paints,
-    // and is left alone in the pane once the fade is over.
+    // A switch is a cut: the woken page is there at once, as the window's
+    // colour until it paints, with nothing of the last page left behind.
     let wakePane = WebPane.Host(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
     let older = WKWebView(frame: .zero)
     wakePane.show(older)
     let woken = WKWebView(frame: .zero)
     woken.loadHTMLString("<title>Woke</title>", baseURL: nil)
     wakePane.show(woken)
-    check("the woken page starts fading in at once", wakePane.subviews.last === woken && woken.alphaValue == 1)
-    spin(EyeComfort.crossfade + 0.4)
-    check("and is alone in the pane once the fade is over", wakePane.subviews.count == 1 && wakePane.subviews.first === woken)
+    check("the woken page replaces the last one at once", wakePane.subviews.count == 1 && wakePane.subviews.first === woken && woken.alphaValue == 1)
+    wakePane.show(older)
+    check("and switching back is a cut too", wakePane.subviews.count == 1 && wakePane.subviews.first === older && older.alphaValue == 1)
     // WebKit hands the colour back resolved, so it is compared by value.
     func rgb(_ colour: NSColor?) -> [Int] {
         guard let c = colour?.usingColorSpace(.sRGB) else { return [] }
@@ -543,6 +581,7 @@ MainActor.assumeIsolated {
     store.select(first)
     spin(0.5)
     check("a page is given the window's colour to wake up in", !rgb(first.webView?.underPageBackgroundColor).isEmpty && rgb(first.webView?.underPageBackgroundColor) == rgb(NSColor.windowBackgroundColor))
+    check("pages get no WebGPU, whose workers WebKit leaks once a page is gone", ask(first, "typeof navigator.gpu") == "undefined")
 
     print("video in full screen")
     // WebKit moves a full-screen page into a window of its own. The videoPane must

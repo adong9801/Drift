@@ -160,6 +160,7 @@ final class Tab: NSObject, ObservableObject, Identifiable {
         if configuration.preferences.responds(to: Selector(("_setDeveloperExtrasEnabled:"))) {
             configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
         }
+        Self.turnOffWebGPU(configuration.preferences)
         // In a world of its own, where the page's scripts cannot reach it.
         configuration.userContentController.addUserScript(WKUserScript(
             source: TabSleep.tracker,
@@ -221,6 +222,31 @@ final class Tab: NSObject, ObservableObject, Identifiable {
         }
         return configuration
     }
+
+    /// WebGPU off. WebKit leaves a thread behind in its GPU process, with the
+    /// graphics surfaces it holds, for every page that asked for a WebGPU
+    /// adapter once that page's view is gone: a tab closed, or put to sleep
+    /// and woken. Ad and fingerprinting scripts ask on page after page. After
+    /// two days of browsing there were 5,336 such threads and 16,676 surfaces,
+    /// the process could not make another, and video stopped playing on every
+    /// site. Next to no site needs WebGPU; WebGL is untouched.
+    ///
+    /// The switch is one of WebKit's private feature flags, looked up by name;
+    /// a WebKit without it leaves WebGPU as it is.
+    static func turnOffWebGPU(_ preferences: WKPreferences) {
+        let setter = NSSelectorFromString("_setEnabled:forFeature:")
+        guard let feature = webGPUFeature, preferences.responds(to: setter),
+              let implementation = class_getMethodImplementation(WKPreferences.self, setter) else { return }
+        typealias SetEnabled = @convention(c) (AnyObject, Selector, Bool, AnyObject) -> Void
+        unsafeBitCast(implementation, to: SetEnabled.self)(preferences, setter, false, feature)
+    }
+
+    private static let webGPUFeature: NSObject? = {
+        let list = NSSelectorFromString("_features")
+        guard (WKPreferences.self as AnyObject).responds(to: list),
+              let features = (WKPreferences.self as AnyObject).perform(list)?.takeUnretainedValue() as? [NSObject] else { return nil }
+        return features.first { $0.value(forKey: "key") as? String == "WebGPUEnabled" }
+    }()
 
     /// Brings this tab's blocking into line with the current switch and list.
     func refreshContentRules() {

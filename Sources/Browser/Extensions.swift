@@ -174,6 +174,8 @@ final class Extensions: NSObject, ObservableObject {
         if pages.preferences.responds(to: Selector(("_setDeveloperExtrasEnabled:"))) {
             pages.preferences.setValue(true, forKey: "developerExtrasEnabled")
         }
+        // A popup is a new page each time it opens; see `Tab.turnOffWebGPU`.
+        Tab.turnOffWebGPU(pages.preferences)
         // Keeps the last errors an extension's own pages threw, for
         // `diagnostics()`. Extensions fail silently as a rule, and this is the
         // only record there is. Nothing leaves the machine unless the user

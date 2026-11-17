@@ -33,51 +33,15 @@ struct WebPane: NSViewRepresentable {
             // would, pulls the page out from under the full-screen transition.
             guard hosted !== webView || webView.fullscreenState == .notInFullscreen else { return }
             hosted = webView
-            // What is on screen right now stays as the backdrop: the last page,
-            // or, if that was itself still fading in, whatever was showing
-            // beneath it. Everything else from earlier switches goes.
-            let outgoing = settle(keeping: webView)
+            // A cut, not a fade: the page is there the moment it is chosen. A
+            // page just woken has nothing painted yet and shows the window's
+            // own colour (see `underPageBackgroundColor` in `Tab.materialize`)
+            // while it loads.
+            for view in subviews where view !== webView { view.removeFromSuperview() }
             webView.frame = bounds
             webView.autoresizingMask = [.width, .height]
-            guard let outgoing else {
-                webView.alphaValue = 1
-                addSubview(webView)
-                return
-            }
-            // Faded in over what was there, which stays put underneath until
-            // the fade is done. A cut from a dark page to a white one is a
-            // jolt; a cross-fade is not. A page just woken has nothing painted
-            // yet and fades in as the window's own colour (see
-            // `underPageBackgroundColor` in `Tab.materialize`), which is what
-            // it should look like while it loads.
-            webView.alphaValue = 0
-            addSubview(webView, positioned: .above, relativeTo: outgoing)
-            fadeIn(webView, over: [outgoing])
-        }
-
-        private func fadeIn(_ webView: WKWebView, over underneath: [NSView]) {
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = EyeComfort.crossfade
-                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                webView.animator().alphaValue = 1
-            } completionHandler: { [weak self] in
-                guard let self else { return }
-                for view in underneath where view !== self.hosted && view.superview === self {
-                    view.removeFromSuperview()
-                }
-            }
-        }
-
-        /// Drops whatever an earlier switch left behind, and answers with the
-        /// one view worth keeping underneath the next page: the topmost that
-        /// can be seen, other than `incoming`.
-        private func settle(keeping incoming: WKWebView) -> NSView? {
-            let backdrop = subviews.last { $0 !== incoming && $0.alphaValue > 0 }
-            for view in subviews where view !== incoming && view !== backdrop {
-                view.removeFromSuperview()
-            }
-            if let backdrop, backdrop === incoming { return nil }
-            return backdrop
+            webView.alphaValue = 1
+            if webView.superview !== self { addSubview(webView) }
         }
     }
 

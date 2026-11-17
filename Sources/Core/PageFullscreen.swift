@@ -20,17 +20,41 @@ enum PageFullscreen {
       window.__driftFullscreen = true;
       var current = null;
       var sheet = null;
-      var css = '[data-drift-fullscreen]{position:fixed!important;inset:0!important;top:0!important;left:0!important;'
+      // The host is a black, viewport-filling box at the document root. The
+      // element the page asked to show full screen is MOVED into it (see enter),
+      // which lifts it clear of every ancestor transform, clip and stacking
+      // context the site wraps it in. A site like X virtualises its timeline
+      // with transforms and re-renders it constantly; a merely z-indexed overlay
+      // left in place gets trapped in those contexts and the page's own chrome
+      // paints back over it within a frame or two. Re-parenting is immune to all
+      // of that. The element is put back exactly where it was on exit.
+      var css = '[data-drift-fs-host]{position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;'
+        + 'max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;border:0!important;'
+        + 'z-index:2147483647!important;background:#000!important;display:block!important;overflow:hidden!important}'
+        + '[data-drift-fs-host] > [data-drift-fullscreen]{position:absolute!important;inset:0!important;top:0!important;left:0!important;'
+        + 'width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;min-width:0!important;min-height:0!important;'
+        + 'margin:0!important;padding:0!important;transform:none!important;border-radius:0!important;border:0!important;background:#000!important;z-index:auto!important}'
+        // An <iframe> cannot be moved — that reloads it and kills an embedded
+        // player — so it is pinned in place with position:fixed instead, and the
+        // ancestor transforms/clips that would otherwise trap the pin are
+        // stripped (see tagAncestors). This rule only applies when NOT in the host.
+        + '[data-drift-fullscreen]{position:fixed!important;inset:0!important;top:0!important;left:0!important;'
         + 'width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;min-width:0!important;min-height:0!important;'
         + 'margin:0!important;padding:0!important;transform:none!important;border-radius:0!important;border:0!important;'
-        + 'z-index:2147483647!important;background:#000!important;object-fit:contain}'
-        // The video inside is placed and sized by the site's script for the
-        // player as it was, and YouTube's arithmetic puts it half off screen
-        // once the player is stretched. Pinned to the viewport itself, it
-        // fills the screen whatever the script says; the player's controls
-        // stay where they are, laid over it.
+        + 'z-index:2147483647!important;background:#000!important}'
+        // Pinned-in-place video: fix it to the viewport, not to whatever inner
+        // box the player positions it in. The site (YouTube) sizes and offsets
+        // the <video> for a portrait clip inside its own container; a
+        // viewport-fixed override ignores that and centres it in the window.
         + '[data-drift-fullscreen] video{position:fixed!important;inset:0!important;left:0!important;top:0!important;width:100vw!important;height:100vh!important;'
         + 'max-width:none!important;max-height:none!important;margin:0!important;transform:none!important;object-fit:contain!important}'
+        // Re-parented video: it now lives in the host at the root, so fill the
+        // host box directly. (Overrides the rule above; placed after it.)
+        + '[data-drift-fs-host] video{position:absolute!important;inset:0!important;left:0!important;top:0!important;width:100%!important;height:100%!important;'
+        + 'max-width:none!important;max-height:none!important;margin:0!important;transform:none!important;object-fit:contain!important}'
+        + '[data-drift-fs-up]{transform:none!important;-webkit-transform:none!important;perspective:none!important;-webkit-perspective:none!important;'
+        + 'filter:none!important;-webkit-filter:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;'
+        + 'will-change:auto!important;contain:none!important;clip-path:none!important}'
         + 'html[data-drift-fullscreen-root],html[data-drift-fullscreen-root]>body{overflow:hidden!important}';
 
       function tell(kind) {
@@ -45,14 +69,68 @@ enum PageFullscreen {
           try { target.dispatchEvent(new Event(name, { bubbles: true })); } catch (e) {}
         });
       }
+      var host = null;      // our black, root-level full-screen box
+      var home = null;      // { parent, next } the moved element is restored to
+      function ensureHost() {
+        if (!host || !host.isConnected) {
+          host = document.createElement('div');
+          host.setAttribute('data-drift-fs-host', '');
+          document.documentElement.appendChild(host);
+        }
+        return host;
+      }
+      function sendHome(el) {
+        if (home && home.parent) {
+          try { home.parent.insertBefore(el, home.next); }
+          catch (e) { try { home.parent.appendChild(el); } catch (e2) {} }
+        }
+        home = null;
+      }
+      // An <iframe> is pinned in place (moving it reloads it); its trapping
+      // ancestors have their transform/clip stripped so the pin reaches the
+      // viewport. Restored by clearAncestors on exit.
+      function tagAncestors(element) {
+        clearAncestors();
+        for (var up = element.parentElement; up && up !== document.documentElement; up = up.parentElement) {
+          up.setAttribute('data-drift-fs-up', '');
+        }
+      }
+      function clearAncestors() {
+        var tagged = document.querySelectorAll('[data-drift-fs-up]');
+        for (var i = 0; i < tagged.length; i++) tagged[i].removeAttribute('data-drift-fs-up');
+      }
+      // Pinning in place is what most players (YouTube) want, and moving a
+      // player's own element out of its tree can break it — YouTube's goes
+      // black. Re-parenting is only needed when an ancestor would trap the pin:
+      // a transform/filter/perspective makes that ancestor the containing block
+      // and a stacking context, so a virtualised, re-rendering feed like X's
+      // keeps pulling the pinned element back behind its chrome. Detect exactly
+      // that case and lift out only then; otherwise pin in place as before.
+      function needsReparent(element) {
+        for (var up = element.parentElement; up && up !== document.documentElement; up = up.parentElement) {
+          try {
+            var cs = getComputedStyle(up);
+            if (cs.transform !== 'none' || cs.perspective !== 'none' || cs.filter !== 'none'
+                || (cs.willChange && /transform|perspective|filter/.test(cs.willChange))
+                || (cs.contain && /strict|content|paint|layout/.test(cs.contain))) return true;
+          } catch (e) {}
+        }
+        return false;
+      }
       function enter(element) {
         if (!(element instanceof Element) || !element.isConnected) return Promise.reject(new TypeError('not in the document'));
         if (current === element) return Promise.resolve();
-        if (current) current.removeAttribute('data-drift-fullscreen');
+        if (current) { current.removeAttribute('data-drift-fullscreen'); sendHome(current); clearAncestors(); }
         if (!sheet) { sheet = document.createElement('style'); sheet.textContent = css; }
         if (!sheet.isConnected) document.documentElement.appendChild(sheet);
         current = element;
         element.setAttribute('data-drift-fullscreen', '');
+        if (element.tagName !== 'IFRAME' && needsReparent(element)) {
+          home = { parent: element.parentNode, next: element.nextSibling };
+          ensureHost().appendChild(element);             // lift a trapped player (X) to the root
+        } else {
+          tagAncestors(element);                         // pin in place (YouTube, iframes, most)
+        }
         document.documentElement.setAttribute('data-drift-fullscreen-root', '');
         tell('enter');
         fire(element);
@@ -65,6 +143,10 @@ enum PageFullscreen {
         var was = current;
         current = null;
         was.removeAttribute('data-drift-fullscreen');
+        sendHome(was);                                   // put a moved element back
+        clearAncestors();                                // un-strip a pinned iframe's ancestors
+        if (host && host.isConnected) host.remove();
+        host = null;
         document.documentElement.removeAttribute('data-drift-fullscreen-root');
         if (sheet) sheet.remove();
         tell('exit');

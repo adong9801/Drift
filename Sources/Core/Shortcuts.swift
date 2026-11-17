@@ -61,9 +61,10 @@ struct Shortcuts: Codable, Equatable {
         for item in items {
             // "yo" finds what was learned for "yout". The other way round,
             // "youtube" finding "yout", holds only once what was learned is long
-            // enough to mean something.
+            // enough to mean something, and only while the text typed on past
+            // it still points at that page.
             let typedIsStart = item.typed.hasPrefix(text)
-            let learnedIsStart = item.typed.count >= 2 && text.hasPrefix(item.typed)
+            let learnedIsStart = item.typed.count >= 2 && text.hasPrefix(item.typed) && Self.stillFits(text, item)
             guard typedIsStart || learnedIsStart else { continue }
 
             let days = max(0, now.timeIntervalSince(item.lastUsed) / 86_400)
@@ -77,5 +78,17 @@ struct Shortcuts: Codable, Equatable {
             .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0.url < $1.0.url }
             .prefix(limit)
             .map(\.0)
+    }
+
+    /// Whether every word of the text starts a word of the page's title or
+    /// address, or of what was learned. With "do" learned for Google Docs,
+    /// "docs" still means it; "does sophia die in lupin" is a question.
+    private static func stillFits(_ text: String, _ item: LearnedShortcut) -> Bool {
+        let page = words(in: item.title + " " + item.url + " " + item.typed)
+        return words(in: text).allSatisfy { word in page.contains { $0.hasPrefix(word) } }
+    }
+
+    private static func words(in text: String) -> [Substring] {
+        text.lowercased().split { !$0.isLetter && !$0.isNumber }
     }
 }
