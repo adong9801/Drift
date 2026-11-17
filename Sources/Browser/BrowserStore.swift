@@ -154,13 +154,19 @@ final class BrowserStore: ObservableObject {
             MainActor.assumeIsolated { self?.sleepIdleTabs(olderThan: TabSleep.idleLimit) }
         }
         sleepTimer?.tolerance = 10
-        // The system saying it is short of memory is a better signal than any
-        // timer: give back everything that is not being looked at.
+        // The system saying it is short of memory is a strong signal — but a
+        // soft `.warning` is common and fires for the whole machine, not Drift,
+        // so it must not override a user who turned tab sleeping (and the memory
+        // budget) off: there it falls back to the normal rules, which do nothing
+        // when sleeping is off. A `.critical` is imminent exhaustion, where a
+        // crash would lose every tab, so there idle tabs are given back anyway.
         let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
         source.setEventHandler { [weak self] in
             MainActor.assumeIsolated {
+                guard let self else { return }
                 FaviconCache.shared.trim()
-                self?.sleepIdleTabs(olderThan: TabSleep.pressureLimit, force: true)
+                let critical = self.memoryPressure?.data.contains(.critical) ?? false
+                self.sleepIdleTabs(olderThan: TabSleep.pressureLimit, force: critical)
             }
         }
         source.resume()
