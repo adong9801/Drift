@@ -366,5 +366,23 @@ do {
     })
 }
 
+print("paste style")
+do {
+    check("copied text pastes plain", PasteStyle.choose(fromPage: false, hasFile: false, hasImage: false, hasText: true, text: "Hello there") == .plain)
+    check("a copied link on its own pastes plain", PasteStyle.choose(fromPage: false, hasFile: false, hasImage: false, hasText: true, text: "https://example.com/") == .plain)
+    check("a copied file pastes as is", PasteStyle.choose(fromPage: false, hasFile: true, hasImage: false, hasText: true, text: "report.pdf") == .asIs)
+    check("a screenshot, with no text, pastes as is", PasteStyle.choose(fromPage: false, hasFile: false, hasImage: true, hasText: false, text: nil) == .asIs)
+    check("Copy Image on a linked image (Google Images) pastes the image, not the link",
+          PasteStyle.choose(fromPage: false, hasFile: false, hasImage: true, hasText: true, text: "https://www.google.com/imgres?imgurl=x&tbnid=y") == .asIs)
+    check("Copy Image on a data: image pastes the image",
+          PasteStyle.choose(fromPage: false, hasFile: false, hasImage: true, hasText: true, text: "data:image/jpeg;base64,/9j/4AAQSkZJRg==") == .asIs)
+    check("Chrome's Copy Image, image and HTML only, pastes the image", PasteStyle.choose(fromPage: false, hasFile: false, hasImage: true, hasText: true, text: nil) == .asIs)
+    check("spreadsheet cells, text with a picture of itself, paste plain",
+          PasteStyle.choose(fromPage: false, hasFile: false, hasImage: true, hasText: true, text: "Name\tTotal\nApples\t3") == .plain)
+    check("one word with a colon is not an address", PasteStyle.choose(fromPage: false, hasFile: false, hasImage: true, hasText: true, text: "Note:draft") == .plain)
+    check("a slide or shape a web app copied in its own formats pastes as is",
+          PasteStyle.choose(fromPage: true, hasFile: false, hasImage: false, hasText: true, text: "Slide seven title") == .asIs)
+}
+
 print(failures == 0 ? "\nall checks passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

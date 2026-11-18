@@ -15,6 +15,26 @@ struct WebPane: NSViewRepresentable {
     final class Host: NSView {
         private weak var hosted: WKWebView?
 
+        /// The pages shown here before this one, newest first. They stay in
+        /// the window, hidden, rather than being taken out of it.
+        ///
+        /// A page put back into a window gets painted afresh, and WebKit holds
+        /// the whole app until it has been, for up to a quarter of a second. A
+        /// heavy page (ChatGPT, with a password manager looking it over as its
+        /// tab comes forward) takes all of that and is still blank after it.
+        /// A hidden page still has its last picture, and is back at once.
+        ///
+        /// To its scripts a hidden page is as gone as one taken out: hidden,
+        /// with no animation frames and its timers slowed. What it keeps is
+        /// that picture, so only the last few are kept; Ctrl-Tab mostly goes
+        /// between them.
+        static let warmLimit = 3
+        private var shownBefore: [Weak] = []
+
+        private struct Weak {
+            weak var view: WKWebView?
+        }
+
         // Escape the page did not want climbs the responder chain to the
         // window, where AppKit takes it as "leave full screen". Stopped here,
         // just above the page: full screen is the window's to keep.
@@ -26,21 +46,33 @@ struct WebPane: NSViewRepresentable {
         override func cancelOperation(_ sender: Any?) {}
 
         func show(_ webView: WKWebView) {
-            guard hosted !== webView || webView.superview !== self else { return }
+            guard hosted !== webView || webView.superview !== self || webView.isHidden else { return }
             // A video gone full screen has been lifted out of here by WebKit,
             // into a window of its own, with a stand-in left behind. It comes
             // back by itself. Taking it back early, as any redraw of the window
             // would, pulls the page out from under the full-screen transition.
             guard hosted !== webView || webView.fullscreenState == .notInFullscreen else { return }
+            let previous = hosted
             hosted = webView
+
+            // Newest first, without the page now shown, and only pages still
+            // here: one put to sleep or closed has already left.
+            var kept = shownBefore.compactMap(\.view).filter { $0 !== webView && $0.superview === self }
+            if let previous, previous !== webView, previous.superview === self { kept.insert(previous, at: 0) }
+            kept = Array(kept.prefix(Self.warmLimit))
+            shownBefore = kept.map { Weak(view: $0) }
+
             // A cut, not a fade: the page is there the moment it is chosen. A
             // page just woken has nothing painted yet and shows the window's
             // own colour (see `underPageBackgroundColor` in `Tab.materialize`)
-            // while it loads.
-            for view in subviews where view !== webView { view.removeFromSuperview() }
+            // while it loads. Older pages, and a full-screen stand-in, go.
+            for view in subviews where view !== webView {
+                if kept.contains(where: { $0 === view }) { view.isHidden = true } else { view.removeFromSuperview() }
+            }
             webView.frame = bounds
             webView.autoresizingMask = [.width, .height]
             webView.alphaValue = 1
+            webView.isHidden = false
             if webView.superview !== self { addSubview(webView) }
         }
     }

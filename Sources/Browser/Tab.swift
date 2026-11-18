@@ -358,7 +358,7 @@ final class Tab: NSObject, ObservableObject, Identifiable {
 
     func takeThumbnail() {
         guard !thumbnailInFlight, Date().timeIntervalSince(lastThumbnail) > 2,
-              let webView, webView.window != nil, webView.bounds.width > 10 else { return }
+              let webView, webView.window != nil, !webView.isHiddenOrHasHiddenAncestor, webView.bounds.width > 10 else { return }
         thumbnailInFlight = true
         let generation = navigationGeneration
         let configuration = WKSnapshotConfiguration()
@@ -597,17 +597,24 @@ final class PageView: WKWebView {
 
     /// ⌘V pastes text as Paste and Match Style does: no fonts, colours or
     /// sizes from wherever it was copied. A page that reads the paste itself,
-    /// as Google Docs does, is handed only the plain text. A copied file, or
-    /// an image with no text alongside it (a screenshot), pastes as before,
-    /// since plain text would make nothing of it.
+    /// as Google Docs does, is handed only the plain text. A copied file or
+    /// image, or what a web app copied in its own formats (a slide in Google
+    /// Slides), pastes as before, since plain text would lose it; see
+    /// `PasteStyle`.
     ///
     /// WKWebView answers both selectors without declaring them, hence the
     /// names.
     @objc func paste(_ sender: Any?) {
         let pasteboard = NSPasteboard.general
-        let isFile = pasteboard.availableType(from: [.fileURL]) != nil
-        let isText = pasteboard.availableType(from: [.string, .rtf, .rtfd, .html]) != nil
-        if isText, !isFile {
+        let hasImage = pasteboard.availableType(from: [.tiff, .png]) != nil
+        let style = PasteStyle.choose(
+            fromPage: pasteboard.availableType(from: [Self.pageWrittenType]) != nil,
+            hasFile: pasteboard.availableType(from: [.fileURL]) != nil,
+            hasImage: hasImage,
+            hasText: pasteboard.availableType(from: [.string, .rtf, .rtfd, .html]) != nil,
+            text: hasImage ? pasteboard.string(forType: .string) : nil
+        )
+        if style == .plain {
             perform(NSSelectorFromString("pasteAsPlainText:"), with: sender)
         } else {
             typealias Action = @convention(c) (AnyObject, Selector, Any?) -> Void
@@ -616,6 +623,11 @@ final class PageView: WKWebView {
             unsafeBitCast(original, to: Action.self)(self, selector, sender)
         }
     }
+
+    /// The type WebKit adds when a page's script wrote the copy, through
+    /// `clipboardData.setData` in its copy handler. It holds the types that
+    /// only the page itself reads back.
+    private static let pageWrittenType = NSPasteboard.PasteboardType("com.apple.WebKit.custom-pasteboard-data")
 
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
         super.willOpenMenu(menu, with: event)
@@ -729,6 +741,15 @@ extension Tab: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        store?.downloads.track(download)
+    }
+
+    /// Download Image, Download Linked File and Download Video in the
+    /// right-click menu. WebKit hands those downloads only to this private
+    /// call, which Safari answers too. Unanswered, the download has no
+    /// delegate to say where it goes, and WebKit drops it without a word.
+    @objc(_webView:contextMenuDidCreateDownload:)
+    func webViewContextMenuDidCreateDownload(_ webView: WKWebView, _ download: WKDownload) {
         store?.downloads.track(download)
     }
 

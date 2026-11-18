@@ -47,7 +47,7 @@ enum DebugArchive {
                 try write(text, to: pages, stem + ".txt")
                 // Only a page on screen can be photographed; WebKit does not
                 // paint the others.
-                if let view = tab.webView, view.window != nil, !tab.isAsleep, let image = await snapshot(view) {
+                if let view = tab.webView, view.window != nil, !view.isHiddenOrHasHiddenAncestor, !tab.isAsleep, let image = await snapshot(view) {
                     try? image.write(to: pages.appendingPathComponent(stem + ".png"))
                 }
             }
@@ -113,7 +113,7 @@ enum DebugArchive {
                     case .exitingFullscreen: marks.append("leaving full screen")
                     default: break
                     }
-                    marks.append(view.window == nil ? "off screen" : "in \(view.window === store.window ? "its window" : "another window")")
+                    marks.append(view.window == nil ? "off screen" : "\(view.isHiddenOrHasHiddenAncestor ? "kept hidden " : "")in \(view.window === store.window ? "its window" : "another window")")
                     if view.responds(to: Selector(("_isPlayingAudio"))), (view.value(forKey: "_isPlayingAudio") as? Bool) == true { marks.append("playing audio") }
                     marks.append("drawn at \(view.window?.backingScaleFactor ?? 0)x, zoom \(view.pageZoom), magnification \(view.magnification)")
                 }

@@ -141,6 +141,11 @@ MainActor.assumeIsolated {
     store.advanceSwitcher(backwards: false)
     store.commitSwitcher()
     check("and again flips back", store.selected?.id == second.id)
+    spin(0.2)
+    // Taken out of the window, a page is painted afresh on its return, and
+    // WebKit holds the app until it has been.
+    check("the tab just left stays in the window, hidden, so coming back is a cut",
+          first.webView?.window === window && first.webView?.isHidden == true && second.webView?.isHidden == false)
 
     print("sleeping tabs")
     // `first` is off screen now. Measure what it costs, put it to sleep, wake it.
@@ -563,16 +568,27 @@ MainActor.assumeIsolated {
 
     print("waking a sleeping tab")
     // A switch is a cut: the woken page is there at once, as the window's
-    // colour until it paints, with nothing of the last page left behind.
+    // colour until it paints, with nothing of the last page showing. The last
+    // page stays behind it, hidden, so going back is a cut as well.
     let wakePane = WebPane.Host(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
     let older = WKWebView(frame: .zero)
     wakePane.show(older)
     let woken = WKWebView(frame: .zero)
     woken.loadHTMLString("<title>Woke</title>", baseURL: nil)
     wakePane.show(woken)
-    check("the woken page replaces the last one at once", wakePane.subviews.count == 1 && wakePane.subviews.first === woken && woken.alphaValue == 1)
+    func showing(_ pane: NSView) -> [NSView] { pane.subviews.filter { !$0.isHidden } }
+    check("the woken page replaces the last one at once", showing(wakePane).count == 1 && showing(wakePane).first === woken && woken.alphaValue == 1)
+    check("the last one is kept behind it, hidden", older.superview === wakePane && older.isHidden)
     wakePane.show(older)
-    check("and switching back is a cut too", wakePane.subviews.count == 1 && wakePane.subviews.first === older && older.alphaValue == 1)
+    check("and switching back is a cut too", showing(wakePane).count == 1 && showing(wakePane).first === older && older.alphaValue == 1)
+    let morePages = (0..<WebPane.Host.warmLimit + 1).map { _ in WKWebView(frame: .zero) }
+    morePages.forEach(wakePane.show)
+    check("only the last few pages are kept", wakePane.subviews.count == WebPane.Host.warmLimit + 1 && older.superview == nil && woken.superview == nil)
+    woken.removeFromSuperview()
+    let sleeper = morePages[1]
+    sleeper.removeFromSuperview()
+    wakePane.show(older)
+    check("a page that has left (asleep or closed) is not brought back", sleeper.superview == nil && wakePane.subviews.count <= WebPane.Host.warmLimit + 1)
     // WebKit hands the colour back resolved, so it is compared by value.
     func rgb(_ colour: NSColor?) -> [Int] {
         guard let c = colour?.usingColorSpace(.sRGB) else { return [] }
