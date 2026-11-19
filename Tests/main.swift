@@ -248,6 +248,11 @@ do {
     check("other Microsoft sites are left alone", SiteQuirks.css(for: "www.microsoft.com") == nil)
     check("a look-alike host gets nothing", SiteQuirks.css(for: "login.microsoftonline.com.evil.example") == nil)
     check("ordinary sites get nothing", SiteQuirks.css(for: "github.com") == nil)
+    check("ChatGPT's messages keep their size as they scroll into view",
+          SiteQuirks.css(for: "chatgpt.com")?.contains("[data-message-render-skipped]") == true
+          && SiteQuirks.css(for: "chatgpt.com")?.contains("content-visibility: visible !important") == true)
+    check("only ever forcing content-visibility to visible, never touching hidden",
+          SiteQuirks.css(for: "chatgpt.com")?.contains("hidden") == false)
     check("the script carries every host and leaves early elsewhere",
           SiteQuirks.all.flatMap(\.hosts).allSatisfy { SiteQuirks.script.contains("\"\($0)\"") } && SiteQuirks.script.contains("if (!css) return;"))
 }
@@ -366,6 +371,50 @@ do {
     })
 }
 
+print("tab groups in ctrl-tab")
+do {
+    // Tabs a…f, most recent first. b and d are in French; e and f in Fun.
+    let ids = (0..<6).map { _ in UUID() }
+    let (a, b, c, d, e, f) = (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5])
+    let french = TabGroup(id: UUID(), name: "French", color: .blue, collapsed: true)
+    let fun = TabGroup(id: UUID(), name: "Fun", color: .pink, collapsed: true)
+    let groupOf = [b: french.id, d: french.id, e: fun.id, f: fun.id]
+    func layout(_ recent: [UUID], _ groups: [TabGroup], _ mode: SwitcherGrouping, open: UUID? = nil) -> [SwitcherSection] {
+        SwitcherLayout.sections(recent: recent, groupOf: groupOf, groups: groups, mode: mode, openGroup: open)
+    }
+
+    let stacked = layout(ids, [french, fun], .stacked)
+    check("a collapsed group is one stacked card, where its latest tab would be",
+          stacked.flatMap(\.entries) == [.tab(a), .group(french.id), .tab(c), .group(fun.id)])
+    var openFrench = french
+    openFrench.collapsed = false
+    check("an expanded group shows its tabs side by side, latest first",
+          layout(ids, [openFrench, fun], .stacked).flatMap(\.entries) == [.tab(a), .tab(b), .tab(d), .tab(c), .group(fun.id)])
+    check("tabs in no group show as they always have", stacked.flatMap(\.entries).contains(.tab(a)) && stacked.flatMap(\.entries).contains(.tab(c)))
+
+    // In front: b, in French. Before it: d, also in French.
+    let fromFrench = [b, d, a, c, e, f]
+    let open = layout(fromFrench, [french, fun], .stacked, open: french.id).flatMap(\.entries)
+    check("the group of the tab in front is open, collapsed or not", open.prefix(2) == [.tab(b), .tab(d)])
+    check("so a quick Ctrl-Tab still lands on the tab before",
+          SwitcherLayout.openingIndex(entries: open, recent: fromFrench, groupOf: groupOf, backwards: false) == 1)
+    let fromA = [a, e, b, c, d, f]
+    let entries = layout(fromA, [french, fun], .stacked).flatMap(\.entries)
+    check("when the tab before is in a stacked group, it opens on that stack",
+          entries[SwitcherLayout.openingIndex(entries: entries, recent: fromA, groupOf: groupOf, backwards: false)] == .group(fun.id))
+
+    let rows = layout(ids, [openFrench, fun], .rows)
+    check("in rows: the latest tabs, then a row per group, then the rest",
+          rows.map(\.title) == ["Recent", "French", "Fun"] && rows[0].entries.count == 5)
+    check("a collapsed group's row is its stack", rows[2].entries == [.group(fun.id)])
+    check("off: every tab its own card, in order", layout(ids, [french, fun], .off).flatMap(\.entries) == ids.map(SwitcherEntry.tab))
+    check("each section starts a row of its own", SwitcherLayout.rowLengths(rows) == [5, 2, 1])
+    check("down from a short row lands in the same column, or the row's last card",
+          SwitcherGrid.jumpRow(from: 3, rowLengths: [5, 2, 1], down: true) == 6)
+    check("and down again goes to the next section", SwitcherGrid.jumpRow(from: 6, rowLengths: [5, 2, 1], down: true) == 7)
+    check("group colours are handed out in turn", GroupColor.next(after: [.blue, .purple]) == .pink)
+}
+
 print("paste style")
 do {
     check("copied text pastes plain", PasteStyle.choose(fromPage: false, hasFile: false, hasImage: false, hasText: true, text: "Hello there") == .plain)
@@ -382,6 +431,61 @@ do {
     check("one word with a colon is not an address", PasteStyle.choose(fromPage: false, hasFile: false, hasImage: true, hasText: true, text: "Note:draft") == .plain)
     check("a slide or shape a web app copied in its own formats pastes as is",
           PasteStyle.choose(fromPage: true, hasFile: false, hasImage: false, hasText: true, text: "Slide seven title") == .asIs)
+}
+
+print("pointer watch")
+do {
+    let start = Date(timeIntervalSince1970: 1_000_000)
+    func at(_ seconds: Double) -> Date { start.addingTimeInterval(seconds) }
+    var track = PointerWatch.Track()
+    track.pageHeardMove(at: at(0))
+    var said = false
+    for tenth in 1...40 { said = track.driftSawMove(at: at(Double(tenth) / 10)) || said }
+    check("a page hearing nothing while the pointer moves over it for 4s is reported", said)
+    var again = false
+    for tenth in 41...80 { again = track.driftSawMove(at: at(Double(tenth) / 10)) || again }
+    check("but only once in a while", !again)
+
+    var heard = PointerWatch.Track()
+    var complained = false
+    for tenth in 1...60 {
+        if tenth % 10 == 0 { heard.pageHeardMove(at: at(Double(tenth) / 10)) }
+        complained = heard.driftSawMove(at: at(Double(tenth) / 10)) || complained
+    }
+    check("a page that keeps hearing the pointer is never reported", !complained)
+
+    var jumpy = PointerWatch.Track()
+    var flagged = false
+    // Single twitches a second apart: never a run of movement long enough.
+    for second in 1...10 { flagged = jumpy.driftSawMove(at: at(Double(second))) || flagged }
+    check("brief twitches of the pointer are not a run of movement", !flagged)
+
+    // Asking the page to draw: sooner than the report, and not over and over.
+    var deaf = PointerWatch.Track()
+    deaf.pageHeardMove(at: at(0))
+    var nudges: [Int] = []
+    for tenth in 1...40 {
+        _ = deaf.driftSawMove(at: at(Double(tenth) / 10))
+        if deaf.shouldNudge(at: at(Double(tenth) / 10)) { nudges.append(tenth) }
+    }
+    check("a page deaf to the pointer is asked to draw after 1.5s of moving", nudges.first.map { (16...17).contains($0) } == true)
+    check("and asked again at most every 1.5s", nudges.count == 2 && nudges[1] - nudges[0] >= 15)
+    var waiting = PointerWatch.Track()
+    var asked = 0
+    for tenth in 1...40 {
+        _ = waiting.driftSawMove(at: at(Double(tenth) / 10))
+        if waiting.shouldNudge(at: at(Double(tenth) / 10)) { asked += 1; waiting.drawAsked = at(Double(tenth) / 10) }
+    }
+    check("not asked again while the last ask is unanswered", asked == 1)
+    var healthy = PointerWatch.Track()
+    var bothered = false
+    for tenth in 1...60 {
+        // The page's word comes at most once a second, a little late.
+        if tenth % 10 == 1 { healthy.pageHeardMove(at: at(Double(tenth) / 10)) }
+        _ = healthy.driftSawMove(at: at(Double(tenth) / 10))
+        bothered = healthy.shouldNudge(at: at(Double(tenth) / 10)) || bothered
+    }
+    check("a page that hears the pointer is never asked to draw", !bothered)
 }
 
 print(failures == 0 ? "\nall checks passed" : "\n\(failures) FAILED")

@@ -32,6 +32,20 @@ enum Design {
     static let privateSoft = dynamic(NSColor(red: 0.42, green: 0.30, blue: 0.78, alpha: 0.12), NSColor(red: 0.68, green: 0.58, blue: 0.98, alpha: 0.20))
     static let danger = dynamic(NSColor(red: 0.882, green: 0.318, blue: 0.318, alpha: 1), NSColor(red: 0.96, green: 0.42, blue: 0.42, alpha: 1))
 
+    /// A tab group's colour, the same in light and dark.
+    static func group(_ color: GroupColor) -> Color {
+        switch color {
+        case .blue: return Color(red: 0.23, green: 0.51, blue: 0.96)
+        case .purple: return Color(red: 0.55, green: 0.36, blue: 0.96)
+        case .pink: return Color(red: 0.93, green: 0.29, blue: 0.60)
+        case .red: return Color(red: 0.94, green: 0.27, blue: 0.27)
+        case .orange: return Color(red: 0.98, green: 0.45, blue: 0.09)
+        case .yellow: return Color(red: 0.92, green: 0.70, blue: 0.03)
+        case .green: return Color(red: 0.13, green: 0.70, blue: 0.37)
+        case .grey: return Color(red: 0.56, green: 0.56, blue: 0.58)
+        }
+    }
+
     static let sidebarWidth: CGFloat = 208
     static let radius: CGFloat = 8
     static let pageRadius: CGFloat = 12

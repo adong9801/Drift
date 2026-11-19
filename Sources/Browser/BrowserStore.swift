@@ -16,10 +16,23 @@ enum CommandBarMode: Equatable {
     case split
 }
 
-/// The Ctrl-Tab overlay: tabs by recency, and which one is lit.
+/// The Ctrl-Tab overlay: cards by recency, tab groups among them as stacks
+/// or rows (see `SwitcherLayout`), and which one is lit.
 struct Switcher: Equatable {
-    var order: [UUID]
-    var index: Int
+    /// Every tab, most recently used first, as it was when the overlay opened.
+    var recent: [UUID]
+    var sections: [SwitcherSection] = []
+    var index: Int = 0
+    /// Shown open whatever its setting: the group of the tab in front.
+    var openGroup: UUID?
+
+    var entries: [SwitcherEntry] { sections.flatMap(\.entries) }
+    var lit: SwitcherEntry? { entries.indices.contains(index) ? entries[index] : nil }
+    /// The lit card's tab, when it is a tab and not a stack.
+    var litTab: UUID? {
+        if case .tab(let id) = lit { return id }
+        return nil
+    }
 }
 
 /// The window's state: which tabs exist, which are on screen, and the overlays
@@ -119,6 +132,7 @@ final class BrowserStore: ObservableObject {
         var url: String?
         var title: String
         var pinned: Bool
+        var group: UUID?
     }
 
     private struct Session: Codable {
@@ -127,6 +141,7 @@ final class BrowserStore: ObservableObject {
         var split: UUID?
         var sidebarVisible: Bool
         var recent: [UUID]?
+        var groups: [TabGroup]?
     }
 
     init(isPrivateWindow: Bool) {
@@ -206,13 +221,56 @@ final class BrowserStore: ObservableObject {
 
     // MARK: - Leaving and returning to the app
 
-    /// Switching to another app hides the page as surely as switching tabs
-    /// does, so a playing video follows the user there too, and comes home
-    /// when they are back.
-    func applicationActiveChanged(_ active: Bool) {
+    /// Switching to another app can hide the page as surely as switching tabs
+    /// does, and then a playing video follows the user there too, and comes
+    /// home when they are back. Only when the window really goes out of sight,
+    /// though: covered, minimised, or on a Space they have left. A click on
+    /// another screen makes another app active and leaves the window in plain
+    /// view, and the video should stay where it is.
+    func applicationActiveChanged(_ active: Bool) { windowSightChanged() }
+
+    /// Whether the window was last seen in sight, as far as picture in
+    /// picture is concerned.
+    private var windowInSight = true
+    private var sightCheck: DispatchWorkItem?
+    /// Set while the window animates in or out of full screen, when it passes
+    /// through being out of sight on its way to the other Space.
+    var fullScreenTransition = false {
+        didSet {
+            guard fullScreenTransition != oldValue else { return }
+            if !fullScreenTransition { return windowSightChanged() }
+            // A transition that fails says nothing at its end.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                MainActor.assumeIsolated { self?.fullScreenTransition = false }
+            }
+        }
+    }
+
+    /// The window's occlusion changed, or might have. Going out of sight is
+    /// believed only if it lasts: a Space switch covers the window for a
+    /// moment on the way.
+    func windowSightChanged() {
+        sightCheck?.cancel()
+        let check = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.settleSight() }
+        }
+        sightCheck = check
+        DispatchQueue.main.asyncAfter(deadline: .now() + (isWindowInSight ? 0 : 0.4), execute: check)
+    }
+
+    private var isWindowInSight: Bool {
+        guard let window else { return false }
+        return window.isVisible && !window.isMiniaturized && window.occlusionState.contains(.visible)
+    }
+
+    private func settleSight() {
+        guard !fullScreenTransition, window != nil else { return }
+        let inSight = isWindowInSight
+        guard inSight != windowInSight else { return }
+        windowInSight = inSight
         guard PictureInPicture.automatic else { return }
         for tab in [selected, split].compactMap({ $0 }) {
-            tab.pictureInPicture(active ? .tabShown : .tabHidden)
+            tab.pictureInPicture(inSight ? .tabShown : .tabHidden)
         }
     }
 
@@ -329,6 +387,29 @@ final class BrowserStore: ObservableObject {
         sidebarPeek = false
     }
 
+    /// A tab picked up to be dragged, from the sidebar peeking out or not.
+    /// The sidebar stays until the mouse button is let go: as a drag starts,
+    /// the pointer counts as having left the panel, and a peeking sidebar
+    /// would slide away with the group the tab was on its way to, leaving it
+    /// to be dropped on the page. What the drag carries is returned.
+    func pickUp(_ tab: Tab) -> TabDrag {
+        peekHeld = true
+        dragWatch?.invalidate()
+        let watch = Timer(timeInterval: 0.2, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
+                guard NSEvent.pressedMouseButtons & 1 == 0 else { return }
+                timer.invalidate()
+                self?.peekHeld = false
+            }
+        }
+        // Common modes, so it is heard while AppKit runs the drag.
+        RunLoop.main.add(watch, forMode: .common)
+        dragWatch = watch
+        return TabDrag(id: tab.id)
+    }
+
+    private var dragWatch: Timer?
+
     private var pointerOverSidebar: Bool {
         guard let window else { return false }
         let x = window.convertPoint(fromScreen: NSEvent.mouseLocation).x
@@ -348,8 +429,78 @@ final class BrowserStore: ObservableObject {
 
     var pinnedTabs: [Tab] { tabs.filter(\.isPinned) }
     var regularTabs: [Tab] { tabs.filter { !$0.isPinned } }
-    /// Sidebar order, which is also what Cmd-1…9 count along.
-    var orderedTabs: [Tab] { pinnedTabs + regularTabs }
+    /// Sidebar order, which is also what Cmd-1…9 count along: pinned tabs,
+    /// then each group's, then the rest.
+    var orderedTabs: [Tab] { pinnedTabs + groups.flatMap { tabs(in: $0.id) } + ungroupedTabs }
+
+    // MARK: - Tab groups
+
+    @Published private(set) var groups: [TabGroup] = []
+
+    func tabs(in group: UUID) -> [Tab] { regularTabs.filter { $0.groupID == group } }
+    var ungroupedTabs: [Tab] { regularTabs.filter { $0.groupID == nil } }
+    func group(_ id: UUID?) -> TabGroup? { groups.first { $0.id == id } }
+
+    @discardableResult
+    func newGroup(named name: String, with tab: Tab) -> TabGroup {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let group = TabGroup(id: UUID(), name: trimmed.isEmpty ? "Group" : trimmed, color: .next(after: groups.map(\.color)), collapsed: false)
+        groups.append(group)
+        add(tab, to: group.id)
+        return group
+    }
+
+    /// Into a group. A pinned tab is unpinned: pinned tabs stand apart.
+    func add(_ tab: Tab, to group: UUID) {
+        guard self.group(group) != nil else { return }
+        if tab.isPinned { tab.isPinned = false }
+        tab.groupID = group
+        groupsChanged()
+    }
+
+    func removeFromGroup(_ tab: Tab) {
+        tab.groupID = nil
+        groupsChanged()
+    }
+
+    func renameGroup(_ id: UUID, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let index = groups.firstIndex(where: { $0.id == id }) else { return }
+        groups[index].name = trimmed
+        sessionChanged()
+    }
+
+    func setColor(_ color: GroupColor, of id: UUID) {
+        guard let index = groups.firstIndex(where: { $0.id == id }) else { return }
+        groups[index].color = color
+        sessionChanged()
+    }
+
+    /// Expanded or collapsed: in the sidebar, and in Ctrl-Tab as tabs or a stack.
+    func setCollapsed(_ id: UUID, _ collapsed: Bool) {
+        guard let index = groups.firstIndex(where: { $0.id == id }) else { return }
+        groups[index].collapsed = collapsed
+        sessionChanged()
+    }
+
+    /// The group goes; its tabs stay, in no group.
+    func ungroup(_ id: UUID) {
+        for tab in tabs where tab.groupID == id { tab.groupID = nil }
+        groupsChanged()
+    }
+
+    func closeGroup(_ id: UUID) {
+        for tab in tabs where tab.groupID == id { close(tab) }
+    }
+
+    /// A group with no tabs left goes too.
+    private func groupsChanged() {
+        let used = Set(tabs.compactMap(\.groupID))
+        for tab in tabs where tab.groupID.map({ id in !groups.contains { $0.id == id } }) == true { tab.groupID = nil }
+        groups.removeAll { !used.contains($0.id) }
+        objectWillChange.send()
+        sessionChanged()
+    }
 
     // MARK: - Private browsing
 
@@ -602,12 +753,13 @@ final class BrowserStore: ObservableObject {
         guard let index = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
         // A private tab cannot be reopened: remembering it would be the leak.
         if !tab.isPrivate, let url = tab.url {
-            closed.append(SavedTab(id: tab.id, url: url.absoluteString, title: tab.title, pinned: tab.isPinned))
+            closed.append(SavedTab(id: tab.id, url: url.absoluteString, title: tab.title, pinned: tab.isPinned, group: tab.groupID))
             if closed.count > 25 { closed.removeFirst() }
         }
         tabs.remove(at: index)
         recent.remove(tab.id)
         queuedBehind.remove(tab.id)
+        if tab.groupID != nil { groupsChanged() }
         Extensions.shared.controller.didCloseTab(tab, windowIsClosing: false)
         // A page in full screen goes with its tab; the window comes back too.
         if fullscreenTab === tab {
@@ -654,12 +806,18 @@ final class BrowserStore: ObservableObject {
 
     func reopenClosed() {
         guard let last = closed.popLast(), let url = last.url.flatMap(URL.init(string:)) else { return }
-        newTab(url, pinned: last.pinned)
+        let tab = newTab(url, pinned: last.pinned)
+        // Back into its group, if the group is still there.
+        if let group = last.group, self.group(group) != nil { add(tab, to: group) }
     }
 
     func togglePin(_ tab: Tab) {
         guard !tab.isPrivate else { return }
         tab.isPinned.toggle()
+        if tab.isPinned, tab.groupID != nil {
+            tab.groupID = nil
+            groupsChanged()
+        }
         objectWillChange.send()
         sessionChanged()
     }
@@ -672,7 +830,11 @@ final class BrowserStore: ObservableObject {
         tabs.remove(at: from)
         let to = tabs.firstIndex(where: { $0.id == target.id }) ?? tabs.count
         tab.isPinned = target.isPinned
+        // Dropped among a group's tabs, it joins the group; among the rest, it leaves.
+        let regrouped = tab.groupID != target.groupID
+        tab.groupID = target.isPinned ? nil : target.groupID
         tabs.insert(tab, at: to)
+        if regrouped { groupsChanged() }
         sessionChanged()
     }
 
@@ -768,7 +930,7 @@ final class BrowserStore: ObservableObject {
 
     func advanceSwitcher(backwards: Bool) {
         if var open = switcher {
-            open.index = SwitcherGrid.step(from: open.index, count: open.order.count, backwards: backwards)
+            open.index = SwitcherGrid.step(from: open.index, count: open.entries.count, backwards: backwards)
             switcher = open
             return
         }
@@ -776,15 +938,30 @@ final class BrowserStore: ObservableObject {
         guard order.count > 1 else { return }
         focused?.takeThumbnail()
         commandBar = nil
-        // Opens already pointing at the previous tab, so a quick tap of
-        // Ctrl-Tab flips between the last two.
-        switcher = Switcher(order: order, index: backwards ? order.count - 1 : 1)
+        var fresh = Switcher(recent: order, openGroup: focused?.groupID)
+        layOut(&fresh)
+        // Opens already pointing at the card holding the previous tab, so a
+        // quick tap of Ctrl-Tab flips between the last two.
+        fresh.index = SwitcherLayout.openingIndex(entries: fresh.entries, recent: order, groupOf: groupOfTab, backwards: backwards)
+        switcher = fresh
+    }
+
+    private var groupOfTab: [UUID: UUID] {
+        Dictionary(uniqueKeysWithValues: tabs.compactMap { tab in tab.groupID.map { (tab.id, $0) } })
+    }
+
+    private func layOut(_ open: inout Switcher) {
+        open.recent.removeAll { tab($0) == nil }
+        open.sections = SwitcherLayout.sections(
+            recent: open.recent, groupOf: groupOfTab, groups: groups,
+            mode: SwitcherGrouping.current, openGroup: open.openGroup
+        )
     }
 
     /// The pointer over a card in the overlay: that becomes the highlighted
     /// one, so letting go of Control lands there.
     func hoverSwitcher(_ index: Int) {
-        guard var open = switcher, open.order.indices.contains(index), open.index != index else { return }
+        guard var open = switcher, open.entries.indices.contains(index), open.index != index else { return }
         open.index = index
         switcher = open
     }
@@ -792,29 +969,69 @@ final class BrowserStore: ObservableObject {
     /// Up and Down in the overlay: a row at a time.
     func moveSwitcherRow(down: Bool) {
         guard var open = switcher else { return }
-        open.index = SwitcherGrid.jumpRow(from: open.index, count: open.order.count, down: down)
+        open.index = SwitcherGrid.jumpRow(from: open.index, rowLengths: SwitcherLayout.rowLengths(open.sections), down: down)
         switcher = open
     }
 
     /// W with the overlay up (Control is already held): close the highlighted tab and stay in the
     /// overlay, so a run of tabs can be cleared without leaving it. The
-    /// highlight moves to whatever slides into the gap.
+    /// highlight moves to whatever slides into the gap. A stack is a whole
+    /// group, too much for one key; W leaves it be.
     func closeSwitcherSelection() {
-        guard var open = switcher, open.order.indices.contains(open.index) else { return }
-        let id = open.order.remove(at: open.index)
+        guard var open = switcher, let id = open.litTab else {
+            if switcher?.lit != nil { NSSound.beep() }
+            return
+        }
         if let tab = tab(id) { close(tab) }
-        guard !open.order.isEmpty else {
+        layOut(&open)
+        guard !open.entries.isEmpty else {
             switcher = nil
             return
         }
-        open.index = min(open.index, open.order.count - 1)
+        open.index = min(open.index, open.entries.count - 1)
+        switcher = open
+    }
+
+    /// G with the overlay up: a stacked group opens out into its tabs, or the
+    /// group of the lit tab folds back into a stack. The same switch as the
+    /// group's arrow in the sidebar.
+    func toggleSwitcherGroup() {
+        guard var open = switcher, let lit = open.lit else { return }
+        let groupID: UUID?
+        let opening: Bool
+        switch lit {
+        case .group(let id): groupID = id; opening = true
+        case .tab(let id): groupID = tab(id)?.groupID; opening = false
+        }
+        guard let groupID, group(groupID) != nil else { return }
+        setCollapsed(groupID, !opening)
+        if !opening, open.openGroup == groupID { open.openGroup = nil }
+        layOut(&open)
+        // The light stays on what was toggled: its stack, or its first tab,
+        // in its own row when groups have rows.
+        let sectionStart = open.sections.firstIndex { $0.group == groupID }.map { open.sections.prefix($0).reduce(0) { $0 + $1.entries.count } }
+        let anywhere = open.entries.firstIndex { entry in
+            switch entry {
+            case .group(let id): return id == groupID
+            case .tab(let id): return tab(id)?.groupID == groupID
+            }
+        }
+        open.index = sectionStart ?? anywhere ?? 0
         switcher = open
     }
 
     func commitSwitcher() {
         guard let open = switcher else { return }
         switcher = nil
-        if let tab = tab(open.order[open.index]) { select(tab) }
+        switch open.lit {
+        case .tab(let id)?:
+            if let tab = tab(id) { select(tab) }
+        case .group(let id)?:
+            // A stack lands on the group's latest tab.
+            if let latest = open.recent.lazy.compactMap({ self.tab($0) }).first(where: { $0.groupID == id }) { select(latest) }
+        case nil:
+            break
+        }
     }
 
     func cancelSwitcher() { switcher = nil }
@@ -889,11 +1106,12 @@ final class BrowserStore: ObservableObject {
         let keptIDs = Set(kept.map(\.id))
         let order = recent.ordered(existing: kept.map(\.id))
         let session = Session(
-            tabs: kept.map { SavedTab(id: $0.id, url: $0.url?.absoluteString, title: $0.title, pinned: $0.isPinned) },
+            tabs: kept.map { SavedTab(id: $0.id, url: $0.url?.absoluteString, title: $0.title, pinned: $0.isPinned, group: $0.groupID) },
             selected: selectedID.flatMap { keptIDs.contains($0) ? $0 : nil } ?? order.first,
             split: splitID.flatMap { keptIDs.contains($0) ? $0 : nil },
             sidebarVisible: sidebarVisible,
-            recent: order
+            recent: order,
+            groups: groups.filter { group in kept.contains { $0.groupID == group.id } }
         )
         Storage.saveAsync(session, to: "session.json")
     }
@@ -903,9 +1121,14 @@ final class BrowserStore: ObservableObject {
         tabs = session.tabs.compactMap { saved in
             guard let url = saved.url.flatMap(URL.init(string:)) else { return nil }
             let tab = Tab(id: saved.id, url: url, title: saved.title, isPinned: saved.pinned)
+            tab.groupID = saved.group
             tab.store = self
             return tab
         }
+        groups = session.groups ?? []
+        let used = Set(tabs.compactMap(\.groupID))
+        groups.removeAll { !used.contains($0.id) }
+        for tab in tabs where tab.groupID.map({ id in !groups.contains { $0.id == id } }) == true { tab.groupID = nil }
         for id in (session.recent ?? []).reversed() where tab(id) != nil { recent.touch(id) }
         selectedID = tab(session.selected)?.id ?? tabs.first?.id
         splitID = session.split.flatMap { $0 == selectedID ? nil : tab($0)?.id }

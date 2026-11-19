@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// The left rail: navigation and the address on top, pinned tabs, then the
 /// open ones, with downloads at the foot. The address lives here rather than
@@ -32,7 +33,8 @@ struct Sidebar: View {
                     }
 
                     newTabRow
-                    ForEach(store.regularTabs) { TabRow(tab: $0, store: store) }
+                    ForEach(store.groups) { GroupSection(group: $0, store: store) }
+                    ForEach(store.ungroupedTabs) { TabRow(tab: $0, store: store) }
                 }
                 .padding(.horizontal, 8)
                 .padding(.top, 10)
@@ -267,9 +269,10 @@ private struct TabRow: View {
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onTapGesture { store.select(tab) }
-        .draggable(tab.id.uuidString)
-        .dropDestination(for: String.self) { dropped, _ in
-            guard let moved = dropped.first.flatMap(UUID.init(uuidString:)).flatMap(store.tab) else { return false }
+        // Asked for only as a drag begins, which is when the sidebar is held.
+        .draggable(store.pickUp(tab))
+        .dropDestination(for: TabDrag.self) { dropped, _ in
+            guard let moved = dropped.first.flatMap({ store.tab($0.id) }) else { return false }
             store.move(moved, before: tab)
             return true
         }
@@ -282,9 +285,160 @@ private struct TabRow: View {
             Button("Duplicate") { if let url = tab.url { store.newTab(url, isPrivate: tab.isPrivate) } }
             Button("Copy Link") { store.copyLink(of: tab) }
             Divider()
+            Menu("Add to Group") {
+                Button("New Group\u{2026}") {
+                    if let name = GroupNaming.ask(title: "Name the new group", initial: "") { store.newGroup(named: name, with: tab) }
+                }
+                if !store.groups.isEmpty {
+                    Divider()
+                    ForEach(store.groups) { group in
+                        Button(group.name) { store.add(tab, to: group.id) }
+                            .disabled(tab.groupID == group.id)
+                    }
+                }
+            }
+            if tab.groupID != nil {
+                Button("Remove from Group") { store.removeFromGroup(tab) }
+            }
+            Divider()
             Button("Close Tab") { store.close(tab) }
             Button("Close Other Tabs") { store.closeOthers(keeping: tab) }
         }
+    }
+}
+
+// MARK: - Dragging tabs
+
+/// What a dragged tab carries: its id, as a type of Drift's own (declared in
+/// Info.plist). Not text. As text, a tab let go over a page went into it: a
+/// Google Doc took the id as typing. And a page under the sidebar, when the
+/// sidebar is only peeking out over it, is what macOS offers a drop to first,
+/// so the sidebar never got it. No page takes this type, so a drop there
+/// goes to the sidebar, and nothing lands in the page.
+struct TabDrag: Codable, Transferable {
+    let id: UUID
+
+    static var transferRepresentation: some TransferRepresentation {
+        CodableRepresentation(contentType: .driftTab)
+    }
+}
+
+extension UTType {
+    static let driftTab = UTType(exportedAs: "local.prototype.drift.tab")
+}
+
+// MARK: - Tab groups
+
+/// A group in the sidebar: a heading that expands and collapses it, and its
+/// tabs under it when expanded. Collapsed, it is a stack in Ctrl-Tab too.
+private struct GroupSection: View {
+    let group: TabGroup
+    @ObservedObject var store: BrowserStore
+    /// A dragged tab is over the group, which it joins if dropped.
+    @State private var targeted = false
+
+    var body: some View {
+        let tabs = store.tabs(in: group.id)
+        let color = Design.group(group.color)
+        // Collapsed over the tab on screen: lit, so it is clear where that is.
+        let holdsFocus = group.collapsed && tabs.contains { $0.id == store.focused?.id }
+
+        VStack(alignment: .leading, spacing: 1) {
+            // Not a Button: a button takes the drag over it for itself, and
+            // a tab dropped on the heading would go nowhere. The tab rows are
+            // the same, a tap and not a button, and take drops.
+            HStack(spacing: 7) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .bold))
+                    .rotationEffect(.degrees(group.collapsed ? 0 : 90))
+                    .foregroundStyle(Design.tertiary)
+                    .frame(width: 10)
+                Circle().fill(color).frame(width: 8, height: 8)
+                Text(group.name)
+                    .font(Design.body(12, weight: .semibold))
+                    .foregroundStyle(holdsFocus ? Design.text : Design.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                if group.collapsed {
+                    Text("\(tabs.count)")
+                        .font(Design.body(11))
+                        .monospacedDigit()
+                        .foregroundStyle(Design.tertiary)
+                }
+            }
+            .padding(.vertical, 6)
+            .padding(.horizontal, 8)
+            .background {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(holdsFocus ? Design.selected : Color.clear)
+            }
+            .contentShape(Rectangle())
+            .hoverHighlight()
+            .onTapGesture { store.setCollapsed(group.id, !group.collapsed) }
+            .help(group.collapsed ? "Expand" : "Collapse")
+            .animation(.easeOut(duration: 0.12), value: group.collapsed)
+            .contextMenu {
+                Button(group.collapsed ? "Expand" : "Collapse") { store.setCollapsed(group.id, !group.collapsed) }
+                Button("Rename\u{2026}") {
+                    if let name = GroupNaming.ask(title: "Rename \u{201C}\(group.name)\u{201D}", initial: group.name) { store.renameGroup(group.id, to: name) }
+                }
+                Menu("Color") {
+                    ForEach(GroupColor.allCases, id: \.self) { choice in
+                        Toggle(choice.label, isOn: Binding(
+                            get: { group.color == choice },
+                            set: { _ in store.setColor(choice, of: group.id) }
+                        ))
+                    }
+                }
+                Divider()
+                Button("Ungroup") { store.ungroup(group.id) }
+                Button("Close Group") { store.closeGroup(group.id) }
+            }
+
+            if !group.collapsed {
+                VStack(alignment: .leading, spacing: 1) {
+                    ForEach(tabs) { TabRow(tab: $0, store: store) }
+                }
+                .padding(.leading, 10)
+                .overlay(alignment: .leading) {
+                    Capsule().fill(color.opacity(0.6)).frame(width: 2).padding(.vertical, 4).padding(.leading, 3)
+                }
+            }
+        }
+        // The whole group takes a dropped tab: its heading, and the space
+        // round its tabs. A tab dropped on one of its tabs lands just there,
+        // and joins the group as well (see `BrowserStore.move`).
+        .background {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(targeted ? color.opacity(0.18) : Color.clear)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(targeted ? color.opacity(0.8) : Color.clear, lineWidth: 1.5)
+                }
+        }
+        .dropDestination(for: TabDrag.self) { dropped, _ in
+            guard let tab = dropped.first.flatMap({ store.tab($0.id) }) else { return false }
+            store.add(tab, to: group.id)
+            return true
+        } isTargeted: { targeted = $0 }
+        .animation(.easeOut(duration: 0.1), value: targeted)
+    }
+}
+
+/// Asks for a group's name.
+@MainActor
+enum GroupNaming {
+    static func ask(title: String, initial: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = initial
+        field.placeholderString = "French, Fun, School\u{2026}"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
     }
 }
 

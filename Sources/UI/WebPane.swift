@@ -74,6 +74,22 @@ struct WebPane: NSViewRepresentable {
             webView.alphaValue = 1
             webView.isHidden = false
             if webView.superview !== self { addSubview(webView) }
+
+            // The page shown goes on top of the hidden ones. A drag does not
+            // look at whether a page is hidden: it goes to the topmost page
+            // under the pointer, so a page woken after this one and still
+            // above it, hidden, took the drop (an image dropped on ChatGPT
+            // landed in a Google Doc in the tab before it). Sorting reorders
+            // in place; taking the page out and adding it back would make
+            // WebKit paint it afresh, which is what keeping pages here avoids.
+            if subviews.last !== webView {
+                sortSubviews({ a, b, shown in
+                    let shown = shown.map { Unmanaged<NSView>.fromOpaque($0).takeUnretainedValue() }
+                    if a === shown { return .orderedDescending }
+                    if b === shown { return .orderedAscending }
+                    return .orderedSame
+                }, context: Unmanaged.passUnretained(webView).toOpaque())
+            }
         }
     }
 

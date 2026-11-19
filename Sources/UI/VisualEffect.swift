@@ -120,10 +120,27 @@ struct WindowButtons: NSViewRepresentable {
                 NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { _ in
                     MainActor.assumeIsolated {
                         store.isFullScreen = full
+                        store.fullScreenTransition = true
                         if !full { store.windowLeavingFullScreen() }
                     }
                 }
             }
+            let settled: [Notification.Name] = [NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification]
+            watching += settled.map { name in
+                NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { _ in
+                    MainActor.assumeIsolated { store.fullScreenTransition = false }
+                }
+            }
+            // Covered, minimised, or on a Space the user left: a playing video
+            // follows them out in picture in picture. See
+            // BrowserStore.applicationActiveChanged.
+            watching.append(
+                NotificationCenter.default.addObserver(
+                    forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+                ) { _ in
+                    MainActor.assumeIsolated { store.windowSightChanged() }
+                }
+            )
             store.isFullScreen = window.styleMask.contains(.fullScreen)
             let moments: [Notification.Name] = [
                 NSWindow.didResizeNotification, NSWindow.didEndLiveResizeNotification,

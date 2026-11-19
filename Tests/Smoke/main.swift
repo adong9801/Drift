@@ -9,6 +9,18 @@ import WebKit
 
 let out = CommandLine.arguments[1]
 var failures = 0
+/// Checks that play sound or open a picture-in-picture window, which a
+/// person at the Mac would see and hear. Off unless asked for, so a run can
+/// go on behind someone's back. See Tests/README.md.
+let mediaChecks = ProcessInfo.processInfo.environment["DRIFT_SMOKE_MEDIA"] == "1"
+
+/// No sound from this web view, whatever plays in it.
+@MainActor func quiet(_ view: WKWebView) {
+    let selector = NSSelectorFromString("_setPageMuted:")
+    guard view.responds(to: selector), let implementation = view.method(for: selector) else { return }
+    typealias SetMuted = @convention(c) (AnyObject, Selector, UInt) -> Void
+    unsafeBitCast(implementation, to: SetMuted.self)(view, selector, 1)
+}
 
 func check(_ label: String, _ condition: Bool) {
     print("  \(condition ? "ok  " : "FAIL") \(label)")
@@ -84,6 +96,13 @@ MainActor.assumeIsolated {
     spin(3) { !agent.isEmpty }
     check("the user agent names Safari", agent.contains("Safari/") && agent.contains("Version/"))
 
+    // Asked when the page has stopped hearing the pointer. WebKit keeps the
+    // callback until the page draws; declared wrongly, that alone ends Drift.
+    first.askToDraw()
+    check("asking a page to draw leaves Drift running and waits for the page", first.pointer.drawAsked != nil)
+    spin(3) { first.pointer.drawAsked == nil }
+    check("and the page answers once it has drawn", first.pointer.drawAsked == nil)
+
     spin(2) { first.thumbnail != nil }
     check("a thumbnail was taken for Ctrl-Tab", first.thumbnail != nil)
     shot("one-tab")
@@ -133,7 +152,7 @@ MainActor.assumeIsolated {
     check("it sits after the tab it was opened from", store.tabs.map(\.id) == [first.id, second.id])
 
     store.advanceSwitcher(backwards: false)
-    check("Ctrl-Tab opens on the previous tab", store.switcher.map { $0.order[$0.index] } == first.id)
+    check("Ctrl-Tab opens on the previous tab", store.switcher?.litTab == first.id)
     spin(0.3)
     shot("switcher")
     store.commitSwitcher()
@@ -282,6 +301,8 @@ MainActor.assumeIsolated {
     // YouTube, which refuses anonymous visitors on this network once it has
     // given them a cookie: a private tab sends none, and the video loads.
     let clip = secret.newTab(URL(string: "https://www.youtube.com/watch?v=jNQXAC9IVRw")!)
+    // It starts playing by itself; heard only when asked for.
+    if !mediaChecks { quiet(clip.materialize()) }
     var clipState = ""
     spin(30) {
         clip.webView?.evaluateJavaScript("(function(){var ps=(window.ytInitialPlayerResponse||{}).playabilityStatus; var v=document.querySelector('video'); return JSON.stringify({playability: ps? ps.status: null, ready: v? v.readyState: -1, cookies: document.cookie.length});})()") { value, _ in clipState = value as? String ?? "" }
@@ -439,7 +460,7 @@ MainActor.assumeIsolated {
     store.select(first)
     spin(0.5)
     store.advanceSwitcher(backwards: false)
-    check("with seven tabs the overlay has two rows", SwitcherGrid.rows(for: store.switcher?.order.count ?? 0) == 2)
+    check("with seven tabs the overlay has two rows", SwitcherGrid.rows(for: store.switcher?.entries.count ?? 0) == 2)
     let startIndex = store.switcher?.index ?? -1
     store.moveSwitcherRow(down: true)
     check("Down moves to the row beneath, same column", store.switcher?.index == SwitcherGrid.jumpRow(from: startIndex, count: 7, down: true) && store.switcher?.index != startIndex)
@@ -450,17 +471,17 @@ MainActor.assumeIsolated {
     let spare = Set(extras.map(\.id))
     @MainActor func aimAtSpare() {
         for _ in 0..<8 {
-            if let open = store.switcher, spare.contains(open.order[open.index]) { return }
+            if let open = store.switcher, open.litTab.map(spare.contains) == true { return }
             store.advanceSwitcher(backwards: false)
         }
     }
     aimAtSpare()
-    let doomed = store.switcher.map { $0.order[$0.index] }
+    let doomed = store.switcher?.litTab
     let tabsWithOverlay = store.tabs.count
     press(13, "w", flags: [.control])
     check("Ctrl-W in the overlay closes the highlighted tab", store.tabs.count == tabsWithOverlay - 1 && doomed.map { id in !store.tabs.contains { $0.id == id } } == true)
     check("and the overlay stays up, pointing at a tab that exists",
-          store.switcher.map { $0.order.count == tabsWithOverlay - 1 && $0.order.indices.contains($0.index) && store.tab($0.order[$0.index]) != nil } == true)
+          store.switcher.map { $0.entries.count == tabsWithOverlay - 1 && $0.entries.indices.contains($0.index) && $0.litTab.flatMap(store.tab) != nil } == true)
     let afterFirst = store.tabs.count
     aimAtSpare()
     press(13, "w", flags: [.control, .command])
@@ -520,7 +541,7 @@ MainActor.assumeIsolated {
     check("with the sidebar up, no notice is needed", store.notice == nil)
     if let behind = store.tabs.first(where: { $0.url?.host == "example.net" }) {
         store.advanceSwitcher(backwards: false)
-        check("Ctrl-Tab right after points at the tab just opened behind", store.switcher.map { $0.order[$0.index] } == behind.id)
+        check("Ctrl-Tab right after points at the tab just opened behind", store.switcher?.litTab == behind.id)
         store.hoverSwitcher(0)
         check("the pointer over a card highlights it", store.switcher?.index == 0)
         store.cancelSwitcher()
@@ -581,6 +602,8 @@ MainActor.assumeIsolated {
     check("the last one is kept behind it, hidden", older.superview === wakePane && older.isHidden)
     wakePane.show(older)
     check("and switching back is a cut too", showing(wakePane).count == 1 && showing(wakePane).first === older && older.alphaValue == 1)
+    // A drag goes to the topmost page under the pointer, hidden or not.
+    check("the page switched back to is on top, so a drop goes to it and not the hidden one", wakePane.subviews.last === older)
     let morePages = (0..<WebPane.Host.warmLimit + 1).map { _ in WKWebView(frame: .zero) }
     morePages.forEach(wakePane.show)
     check("only the last few pages are kept", wakePane.subviews.count == WebPane.Host.warmLimit + 1 && older.superview == nil && woken.superview == nil)
@@ -662,6 +685,9 @@ MainActor.assumeIsolated {
     store.close(fsTab)
     check("closing the tab in full screen ends it, with no ghost left on show", store.fullscreenTab == nil && !fsTab.isPageFullscreen && !store.tabs.contains { $0 === fsTab })
 
+    if !mediaChecks {
+        print("video: skipped, since it plays sound and opens picture in picture (DRIFT_SMOKE_MEDIA=1 runs it)")
+    } else {
     print("video")
     let videoTab = store.newTab(URL(string: "data:text/html,%3Ctitle%3EVideo%3C/title%3E%3Cbody%20style%3D%22margin%3A0%3Bbackground%3A%23111%22%3E%3Cvideo%20id%3D%22v%22%20autoplay%20loop%20playsinline%20style%3D%22width%3A100%25%22%20src%3D%22https%3A//interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4%22%3E%3C/video%3E")!)
     var state: [String: Any] = [:]
@@ -723,6 +749,7 @@ MainActor.assumeIsolated {
     spin(5) { !decision.isEmpty }
     check("a muted one is left where it is", decision == "none")
     store.close(videoTab)
+    }
 
     print("site quirks")
     // Microsoft covers its empty inputs with a <div> of hint text, which makes
@@ -973,6 +1000,68 @@ MainActor.assumeIsolated {
         store.close(probe)
     } else {
         print("extensions: skipped, no fixtures")
+    }
+
+    print("dark google docs")
+    // A public Chromium design doc with a photo near the top. Off screen
+    // nothing is painted, but the styles that decide the look can be read.
+    let docs = store.newTab(URL(string: "https://docs.google.com/document/d/1cSW8fpJIUnibQKU8TMwLE5VxYZPh4u4LNu_wtkok8UE/edit")!)
+    spin(0.5)
+    docs.webView?.appearance = NSAppearance(named: .darkAqua)
+    let pictureLayer = "canvas.kix-canvas-tile-content ~ .kix-canvas-tile-content > svg"
+    spin(30) { !docs.isLoading && ask(docs, "document.querySelector('\(pictureLayer)') ? 'yes' : 'no'") == "yes" }
+    @MainActor func docsLook() -> String {
+        ask(docs, "getComputedStyle(document.documentElement).filter + ' | ' + getComputedStyle(document.querySelector('\(pictureLayer)')).filter")
+    }
+    check("in dark mode a document is inverted, with its hue kept",
+          docsLook().hasPrefix("invert(1) hue-rotate(180deg) |"))
+    check("and the layer its pictures are drawn in is turned back", docsLook().hasSuffix("| invert(1) hue-rotate(180deg)"))
+    docs.sampleTint()
+    spin(3) { docs.tint?.wantsLightText == true }
+    check("the top colour follows it into the dark", docs.tint?.wantsLightText == true)
+    docs.setDocsDark(false)
+    spin(0.5)
+    check("the View menu switch turns it off in an open tab", docsLook() == "none | none")
+    docs.setDocsDark(true)
+    spin(0.5)
+    check("and on again", docsLook().hasPrefix("invert(1) hue-rotate(180deg) |"))
+    docs.webView?.appearance = NSAppearance(named: .aqua)
+    spin(0.5)
+    check("in light mode the document is left as it is", docsLook() == "none | none")
+    store.close(docs)
+
+    print("chrome web store")
+    // The store greys out "Add to Chrome" outside Chrome; Drift makes it its own.
+    let ubolID = "ddkjiahejlhfcafbddmgiahcphecmpfh"
+    let storePage = store.newTab(URL(string: "https://chromewebstore.google.com/detail/ublock-origin-lite/\(ubolID)")!)
+    let storeButtons = "JSON.stringify(Array.prototype.map.call(document.querySelectorAll('button[data-drift-store]'), function (b) { return b.textContent.trim() + (b.disabled ? ' (disabled)' : ''); }))"
+    spin(40) { !storePage.isLoading && ask(storePage, storeButtons).contains("Drift") }
+    let expected = Extensions.shared.installed(storeID: ubolID, name: "uBlock Origin Lite") == nil ? "Add to Drift" : "Remove from Drift"
+    let shown = ask(storePage, storeButtons)
+    print("       \(shown)")
+    check("the store's greyed-out install button becomes \u{201c}\(expected)\u{201d}, and can be clicked",
+          shown.contains(expected) && !shown.contains("(disabled)"))
+    check("the store's \u{201c}Switch to Chrome to install\u{201d} strip is put away",
+          ask(storePage, "(function () { var w = document.createTreeWalker(document.querySelector('main') || document.body, NodeFilter.SHOW_TEXT); for (var n = w.nextNode(); n; n = w.nextNode()) { if (/Switch to Chrome to install/.test(n.nodeValue)) return n.parentElement.getClientRects().length ? 'shown' : 'hidden'; } return 'absent'; })()") != "shown")
+    store.close(storePage)
+
+    print("tab groups")
+    do {
+        // A tab of its own, behind, so the one in front stays as it was.
+        let grouped = store.newTab(URL(string: "data:text/html,%3Ctitle%3EGrouped%3C/title%3EGrouped")!, inBackground: true)
+        spin(1)
+        let group = store.newGroup(named: "Smoke group", with: grouped)
+        store.setCollapsed(group.id, true)
+        store.advanceSwitcher(backwards: false)
+        check("a collapsed group is one stacked card in Ctrl-Tab",
+              store.switcher.map { $0.entries.contains(.group(group.id)) && !$0.entries.contains(.tab(grouped.id)) } == true)
+        store.cancelSwitcher()
+        store.saveNow()
+        let file = (try? String(contentsOf: Storage.directory.appendingPathComponent("session.json"), encoding: .utf8)) ?? ""
+        check("groups are saved with the session", file.contains("Smoke group"))
+        store.ungroup(group.id)
+        check("ungrouping keeps the tab and drops the group", store.tab(grouped.id) != nil && store.groups.isEmpty && grouped.groupID == nil)
+        store.close(grouped)
     }
 
     print("session")

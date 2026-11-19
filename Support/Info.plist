@@ -19,9 +19,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.3</string>
+	<string>0.4</string>
 	<key>CFBundleVersion</key>
-	<string>3</string>
+	<string>4</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.4</string>
 	<key>LSApplicationCategoryType</key>
@@ -71,5 +71,19 @@
 	<string>A web page you allowed wants to use the microphone.</string>
 	<key>NSLocationUsageDescription</key>
 	<string>A web page you allowed wants to know your location.</string>
+	<!-- What a dragged tab carries: a type only Drift's sidebar takes, so a web page never does. -->
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>local.prototype.drift.tab</string>
+			<key>UTTypeDescription</key>
+			<string>Drift tab</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

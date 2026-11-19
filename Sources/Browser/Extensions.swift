@@ -19,6 +19,10 @@ struct InstalledExtension: Codable, Identifiable, Equatable {
     /// an extension is someone else's code with storage of its own, and what
     /// it noted down about a private tab would outlive the session.
     var allowedInPrivate: Bool?
+    /// Whether its button sits in the toolbar. Nil, as for every record saved
+    /// before this existed, means it does; unpinned, it is reached from the
+    /// extensions menu.
+    var pinned: Bool?
 
     /// "canvas.school.edu, *.instructure.com" as match patterns, dropping
     /// anything that is not one.
@@ -263,6 +267,25 @@ final class Extensions: NSObject, ObservableObject {
         installed.filter { contexts[$0.id]?.action(for: nil) != nil }
     }
 
+    /// The installed extension that is this Chrome Web Store item: by the
+    /// store link it was installed from, or, for one installed from a file,
+    /// by name.
+    func installed(storeID id: String, name: String?) -> InstalledExtension? {
+        installed.first { $0.source.flatMap(ExtensionSource.storeID(in:)) == id }
+            ?? name.flatMap { name in installed.first { self.name(of: $0) == name } }
+    }
+
+    /// The ones whose buttons are in the toolbar.
+    var toolbar: [InstalledExtension] {
+        actionable.filter { $0.pinned != false }
+    }
+
+    func setPinned(_ record: InstalledExtension, _ pinned: Bool) {
+        guard let index = installed.firstIndex(where: { $0.id == record.id }) else { return }
+        installed[index].pinned = pinned
+        save()
+    }
+
     /// The name straight from the manifest, for an extension that is switched
     /// off and so has no context to ask.
     private func manifestName(_ record: InstalledExtension) -> String? {
@@ -471,14 +494,16 @@ final class Extensions: NSObject, ObservableObject {
             ExtensionLog.note("loaded \(parsed.displayName ?? record.id) \(parsed.displayVersion ?? "") at \(context.baseURL.absoluteString)\(context.errors.isEmpty ? "" : " with errors: \(context.errors.map(\.localizedDescription))")")
             // Not awaited: an extension leaning on something WebKit lacks can
             // leave this hanging for good, and the rest of the browser should
-            // not wait with it.
-            context.loadBackgroundContent { [weak self] error in
+            // not wait with it. One with nothing to run in the background, only
+            // scripts for pages (Modern for Wikipedia), is not asked: WebKit
+            // answers that with an error, which read as "did not start".
+            if parsed.hasBackgroundContent { context.loadBackgroundContent { [weak self] error in
                 ExtensionLog.note("background of \(parsed.displayName ?? record.id): \(error.map { "FAILED \($0.localizedDescription)" } ?? "running")")
                 guard let error else { return }
                 Task { @MainActor in
                     self?.lastError = "\(parsed.displayName ?? "An extension") did not start: \(error.localizedDescription)"
                 }
-            }
+            } }
             revision += 1
         } catch {
             lastError = "\(manifestName(record) ?? "An extension") could not be loaded: \(error.localizedDescription)"
@@ -546,6 +571,10 @@ final class Extensions: NSObject, ObservableObject {
     func registerAnchor(_ view: NSView, for id: String) {
         anchors[id] = WeakView(view: view)
     }
+
+    /// The extensions button, which a popup hangs from when its own button
+    /// is not in the toolbar.
+    static let menuAnchor = "drift.extensions-button"
 
     /// Closes the extension popup that is showing. False if none was, so the
     /// caller can go on to whatever Cmd-W would otherwise mean.
@@ -848,8 +877,9 @@ extension Extensions: WKWebExtensionControllerDelegate {
                 self.openAction = nil
             }
         }
-        // Off its own button if that is on screen, else the window's corner.
-        if let anchor = anchors[context.uniqueIdentifier]?.view, anchor.window != nil {
+        // Off its own button if that is on screen, else the extensions button
+        // it was opened from, else the window's corner.
+        if let anchor = (anchors[context.uniqueIdentifier] ?? anchors[Self.menuAnchor])?.view, anchor.window != nil {
             popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .maxY)
         } else if let content = NSApp.keyWindow?.contentView ?? NSApp.windows.first?.contentView {
             let corner = NSRect(x: 40, y: content.bounds.maxY - 40, width: 1, height: 1)

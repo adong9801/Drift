@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Type Along</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>Type Along</h1>
+    <span id="progress"></span>
+  </header>
+
+  <textarea id="text" spellcheck="false" placeholder="Paste the text you want to type"></textarea>
+
+  <label class="option">
+    <input type="checkbox" id="strict" checked>
+    Wait for the right key
+  </label>
+
+  <div class="buttons">
+    <button id="start" class="primary">Start</button>
+    <button id="pause">Pause</button>
+    <button id="restart">Start Over</button>
+    <button id="stop">Stop</button>
+  </div>
+
+  <p class="hint">Click into a text box and type. The next words show in grey where you type; a wrong key shows in red until you delete it.</p>
+
+  <script src="popup.js"></script>
+</body>
+</html>

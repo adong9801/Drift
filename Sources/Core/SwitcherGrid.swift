@@ -20,11 +20,24 @@ enum SwitcherGrid {
     /// has no card under some columns; those land on its final card instead.
     static func jumpRow(from index: Int, count: Int, down: Bool) -> Int {
         guard count > 0 else { return 0 }
-        let total = rows(for: count)
-        guard total > 1 else { return index }
-        let column = index % columns
-        let row = index / columns
-        let target = (row + (down ? 1 : -1) + total) % total
-        return min(target * columns + column, count - 1)
+        let full = Array(repeating: columns, count: count / columns)
+        return jumpRow(from: index, rowLengths: count % columns == 0 ? full : full + [count % columns], down: down)
+    }
+
+    /// The same over rows of any length, which is what a grid with a row per
+    /// tab group has: a short row can come anywhere, not only last.
+    static func jumpRow(from index: Int, rowLengths: [Int], down: Bool) -> Int {
+        let lengths = rowLengths.filter { $0 > 0 }
+        guard lengths.count > 1 else { return index }
+        var start = 0
+        var row = 0
+        while row < lengths.count - 1, index >= start + lengths[row] {
+            start += lengths[row]
+            row += 1
+        }
+        let column = index - start
+        let target = (row + (down ? 1 : -1) + lengths.count) % lengths.count
+        let targetStart = lengths.prefix(target).reduce(0, +)
+        return targetStart + min(column, lengths[target] - 1)
     }
 }

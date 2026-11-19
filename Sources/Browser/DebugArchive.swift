@@ -41,6 +41,12 @@ enum DebugArchive {
                 var text = "\(tab.url?.absoluteString ?? "no address")\n\(tab.title)\n"
                 if let view = tab.webView, view.window != nil, !tab.isAsleep {
                     text += "page says: \(await pageMetrics(view))\n"
+                    // Twice, a second apart: a video playing as black has its
+                    // frames still counting up if only the picture is lost.
+                    if tab.hasVideo {
+                        try? await Task.sleep(for: .seconds(1))
+                        text += "a second later: \(await pageMetrics(view))\n"
+                    }
                 }
                 text += "\n"
                 text += tab.log.render()
@@ -118,6 +124,12 @@ enum DebugArchive {
                     marks.append("drawn at \(view.window?.backingScaleFactor ?? 0)x, zoom \(view.pageZoom), magnification \(view.magnification)")
                 }
                 lines.append("- [\(marks.joined(separator: ", "))] \(tab.url?.absoluteString ?? "no address") — \(tab.title)")
+                // Where the pointer is now, which is usually the menu the archive
+                // was made from; the tab's log has the same report from the moment
+                // the page stopped hearing the pointer, if it did.
+                if store.isVisible(tab), let window = tab.webView?.window {
+                    lines.append("    pointer: \(tab.pointerReport(at: window.convertPoint(fromScreen: NSEvent.mouseLocation)))")
+                }
             }
         }
 
@@ -132,10 +144,26 @@ enum DebugArchive {
 
     /// What the page believes about the screen it is on, for telling a page
     /// that is drawing itself at the wrong scale from one that only looks so.
+    /// The page's size and visibility, and each video's state: whether it
+    /// plays, where it is shown (inline or picture in picture), and how many
+    /// frames it has decoded and dropped.
+    private static let metricsScript = """
+    JSON.stringify({
+      devicePixelRatio: window.devicePixelRatio, innerWidth: innerWidth, innerHeight: innerHeight,
+      zoom: getComputedStyle(document.documentElement).zoom, visibility: document.visibilityState,
+      videos: Array.prototype.slice.call(document.querySelectorAll('video'), 0, 4).map(function (v) {
+        var r = v.getBoundingClientRect();
+        return { paused: v.paused, ready: v.readyState, mode: v.webkitPresentationMode, video: v.videoWidth + 'x' + v.videoHeight,
+                 box: Math.round(r.width) + 'x' + Math.round(r.height), decoded: v.webkitDecodedFrameCount, dropped: v.webkitDroppedFrameCount,
+                 time: Math.round(v.currentTime * 10) / 10 };
+      })
+    })
+    """
+
     private static func pageMetrics(_ view: WKWebView) async -> String {
         await withCheckedContinuation { continuation in
             var done = false
-            view.evaluateJavaScript("JSON.stringify({devicePixelRatio: window.devicePixelRatio, innerWidth: innerWidth, innerHeight: innerHeight, zoom: getComputedStyle(document.documentElement).zoom, visibility: document.visibilityState})") { value, error in
+            view.evaluateJavaScript(Self.metricsScript) { value, error in
                 guard !done else { return }
                 done = true
                 continuation.resume(returning: value as? String ?? "could not ask: \(error?.localizedDescription ?? "?")")

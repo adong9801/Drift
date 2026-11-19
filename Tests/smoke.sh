@@ -1,6 +1,8 @@
 #!/bin/zsh
-# Runs the real browser offscreen against the network. Shows no window, and
-# keeps its session, history and block list in a scratch folder.
+# Runs the real browser offscreen against the network. Shows no window, plays
+# no sound, and keeps its session, history and block list in a scratch folder.
+# DRIFT_SMOKE_MEDIA=1 adds the video checks, which play sound and open a
+# picture-in-picture window on screen.
 set -euo pipefail
 
 ROOT=${0:a:h:h}

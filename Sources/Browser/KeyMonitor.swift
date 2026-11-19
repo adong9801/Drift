@@ -14,6 +14,7 @@ final class KeyMonitor {
         static let escape: UInt16 = 53
         static let delete: UInt16 = 51
         static let w: UInt16 = 13
+        static let g: UInt16 = 5
         static let q: UInt16 = 12
         static let up: UInt16 = 126
         static let down: UInt16 = 125
@@ -57,6 +58,14 @@ final class KeyMonitor {
             // Only moves within the browser window itself: a popover is a
             // window of its own, and its coordinates say nothing about the sidebar.
             if !store.sidebarVisible, event.window === store.window { store.pointerMoved(x: event.locationInWindow.x) }
+            // Whether the page under the pointer hears it too; see PointerWatch.
+            if let window = event.window {
+                for tab in [store.selected, store.split].compactMap({ $0 }) {
+                    guard let view = tab.webView, view.window === window, !view.isHiddenOrHasHiddenAncestor,
+                          view.visibleRect.contains(view.convert(event.locationInWindow, from: nil)) else { continue }
+                    tab.pointerMoved(at: event.locationInWindow)
+                }
+            }
             return event
 
         case .flagsChanged:
@@ -111,6 +120,11 @@ final class KeyMonitor {
                 // Command out of habit works too.
                 if event.keyCode == Key.w {
                     store.closeSwitcherSelection()
+                    return nil
+                }
+                // G: open a stacked group out, or fold one back up.
+                if event.keyCode == Key.g {
+                    store.toggleSwitcherGroup()
                     return nil
                 }
                 switch event.keyCode {

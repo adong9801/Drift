@@ -32,6 +32,23 @@ struct PageTint: Equatable {
     /// failing that, whatever opaque background is actually under the top edge.
     static let script = """
     (function () {
+      // What the eye sees, which is not what the page asked for when the
+      // whole page is under a filter, as Google Docs is in dark mode (see
+      // DocsDark): the same invert and half turn of hue, done by hand.
+      function seen(rgb) {
+        var filter = getComputedStyle(document.documentElement).filter || '';
+        var invert = filter.match(/invert\\(([\\d.]+)(%?)\\)/);
+        if (!invert) return rgb;
+        var a = parseFloat(invert[1]) / (invert[2] ? 100 : 1);
+        var c = rgb.map(function (v) { return 255 * a + (1 - 2 * a) * v; });
+        if (/hue-rotate\\(180deg\\)/.test(filter)) {
+          c = [-0.574 * c[0] + 1.43 * c[1] + 0.144 * c[2],
+               0.426 * c[0] + 0.43 * c[1] + 0.144 * c[2],
+               0.426 * c[0] + 1.43 * c[1] - 0.856 * c[2]];
+        }
+        return c.map(function (v) { return Math.max(0, Math.min(255, Math.round(v))); });
+      }
+      return seen((function () {
       function normalised(css) {
         var probe = document.createElement('div');
         probe.style.color = css;
@@ -70,6 +87,7 @@ struct PageTint: Equatable {
       var scheme = getComputedStyle(document.documentElement).colorScheme || '';
       var dark = scheme.indexOf('dark') >= 0 && matchMedia('(prefers-color-scheme: dark)').matches;
       return dark ? [30, 30, 30] : [255, 255, 255];
+      })());
     })()
     """
 }

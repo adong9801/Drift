@@ -25,6 +25,19 @@ enum SiteQuirks {
             ],
             css: ".placeholderContainer .placeholderInnerContainer, .placeholderContainer .placeholder { pointer-events: none !important; }"
         ),
+        // ChatGPT leaves the messages it is not showing unrendered, with
+        // `content-visibility: auto` and a guessed height of nothing, and
+        // likewise long code blocks and tables. Chrome renders such an element
+        // a little before it comes into view, where scroll anchoring hides the
+        // change. WebKit renders it only once it is on screen, so scrolling up
+        // a long chat, each message grew from nothing in front of the reader
+        // and shoved the text down: the page jumped, and felt slow. Drawn all
+        // along, they keep their size. ChatGPT already keeps only the part of
+        // the chat near the screen in the page, so this costs little.
+        Quirk(
+            hosts: ["chatgpt.com", "chat.openai.com"],
+            css: "[data-message-render-skipped], [class~='[content-visibility:auto]'], [class*='UnwrappedCodeBlock-'], [class*='TableContainer-'], [class*='SourceFallback-'] { content-visibility: visible !important; }"
+        ),
     ]
 
     static func css(for host: String) -> String? {

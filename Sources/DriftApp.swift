@@ -201,6 +201,13 @@ struct BrowserCommands: Commands {
                 get: { EyeComfort.dimsBrightPages },
                 set: { EyeComfort.dimsBrightPages = $0 }
             ))
+            Toggle("Dark Google Docs in Dark Mode", isOn: Binding(
+                get: { DocsDark.enabled },
+                set: { on in
+                    DocsDark.enabled = on
+                    BrowserStore.all.flatMap(\.tabs).forEach { $0.setDocsDark(on) }
+                }
+            ))
             Divider()
         }
 

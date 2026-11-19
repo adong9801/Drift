@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import WebKit
 
 /// The extensions' buttons, and the puzzle piece that opens the manager. Sits
 /// at the foot of the sidebar, or in the top bar when the sidebar is hidden.
@@ -13,7 +14,7 @@ struct ExtensionBar: View {
         // A Group, not a stack: whatever holds the bar lays the buttons out,
         // and the sidebar's footer wraps them when they do not fit in a row.
         Group {
-            ForEach(extensions.actionable) { record in
+            ForEach(extensions.toolbar) { record in
                 ExtensionButton(record: record, extensions: extensions)
             }
             Button { managing.toggle() } label: {
@@ -22,11 +23,14 @@ struct ExtensionBar: View {
                     .foregroundStyle(ink.opacity(0.85))
                     .frame(width: 26, height: 23)
                     .contentShape(Rectangle())
+                    // A popup opened from the menu, for an extension whose
+                    // button is not in the toolbar, hangs from here.
+                    .background { PopoverAnchor(id: Extensions.menuAnchor) }
             }
             .buttonStyle(.plain)
             .help("Extensions")
             .popover(isPresented: $managing, arrowEdge: .bottom) {
-                ExtensionManager(extensions: extensions)
+                ExtensionManager(extensions: extensions, dismiss: { managing = false })
             }
             // The sidebar may only be peeking out; it must stay while the
             // manager hangs off it, or the manager goes with it.
@@ -76,6 +80,7 @@ private struct ExtensionButton: View {
             if extensions.context(record.id)?.optionsPageURL != nil {
                 Button("Options") { extensions.openOptions(record) }
             }
+            Button("Hide from Toolbar") { extensions.setPinned(record, false) }
             Button("Turn Off") { extensions.setEnabled(record, false) }
         }
     }
@@ -95,39 +100,129 @@ private struct PopoverAnchor: NSViewRepresentable {
     }
 }
 
+
 // MARK: - Manager
 
-/// What is installed, and the ways to install more: a Chrome Web Store link, a
-/// direct link to an archive, or a file or folder on disk.
+/// The extensions menu: one row for each extension, on top the ones that are
+/// on, and the ways to install more behind the plus. A row opens its
+/// extension; the pin puts its button in the toolbar or takes it out; the
+/// switch turns it on and off; the rest (options, where it may run, private
+/// windows, removing it) is in the row's "…" menu.
 struct ExtensionManager: View {
     @ObservedObject var extensions: Extensions
+    /// Puts the menu away, so that a popup opened from it is not left
+    /// hanging off a menu that has gone. Nil in the menu bar's panel.
+    var dismiss: (() -> Void)?
+    @State private var adding = false
     @State private var link = ""
+    @State private var editingSites: String?
+    @State private var sitesText = ""
+    @State private var removing: InstalledExtension?
+
+    /// Those that are on first, each group in the order installed.
+    private var ordered: [InstalledExtension] {
+        extensions.installed.filter(\.enabled) + extensions.installed.filter { !$0.enabled }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            if extensions.installed.isEmpty {
+                Text("None installed yet.")
+                    .font(Design.body(12))
+                    .foregroundStyle(Design.secondary)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 10)
+            } else {
+                VStack(spacing: 1) {
+                    ForEach(ordered) { record in
+                        ExtensionRow(
+                            record: record,
+                            extensions: extensions,
+                            open: { open(record) },
+                            editSites: {
+                                sitesText = (record.sites ?? []).joined(separator: ", ")
+                                editingSites = record.id
+                            },
+                            remove: { removing = record }
+                        )
+                        if editingSites == record.id { sitesEditor(record) }
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.bottom, 6)
+            }
+            if adding || extensions.installed.isEmpty {
+                Rectangle().fill(Design.border).frame(height: 1)
+                installer
+            }
+            if let error = extensions.lastError {
+                Text(error)
+                    .font(Design.body(11))
+                    .foregroundStyle(Design.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
+            }
+        }
+        .padding(.vertical, 10)
+        .frame(width: 360)
+        .alert(
+            "Remove \(removing.map { extensions.name(of: $0) } ?? "this extension")?",
+            isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } })
+        ) {
+            Button("Remove", role: .destructive) {
+                if let record = removing { extensions.remove(record) }
+                removing = nil
+            }
+            Button("Cancel", role: .cancel) { removing = nil }
+        } message: {
+            Text("You can install it again later, but anything it has saved may be gone.")
+        }
+    }
+
+    private var header: some View {
+        HStack {
             Text("Extensions")
                 .font(Design.body(15, weight: .semibold))
                 .foregroundStyle(Design.text)
-
-            if extensions.installed.isEmpty {
-                Text("None installed. Paste a Chrome Web Store link below, or choose an extension you have downloaded.")
-                    .font(Design.body(12))
-                    .foregroundStyle(Design.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                VStack(spacing: 2) {
-                    ForEach(extensions.installed) { record in
-                        row(record)
-                        if extensions.asksForEverySite(record) { sitesRow(record) }
-                        privateRow(record)
-                    }
+            Spacer()
+            if !extensions.installed.isEmpty {
+                Button { adding.toggle() } label: {
+                    Image(systemName: adding ? "xmark" : "plus")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Design.secondary)
+                        .frame(width: 24, height: 22)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .help(adding ? "Close" : "Add an Extension")
             }
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 8)
+    }
 
-            Rectangle().fill(Design.border).frame(height: 1)
+    /// Where an extension that asked for every site may actually run.
+    private func sitesEditor(_ record: InstalledExtension) -> some View {
+        HStack(spacing: 6) {
+            TextField("canvas.school.edu, *.instructure.com", text: $sitesText)
+                .textFieldStyle(.roundedBorder)
+                .font(Design.body(11))
+                .onSubmit { saveSites(record) }
+            Button("Save") { saveSites(record) }
+            Button("Cancel") { editingSites = nil }
+        }
+        .controlSize(.small)
+        .padding(.leading, 38)
+        .padding(.trailing, 8)
+        .padding(.bottom, 6)
+    }
 
+    private var installer: some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                TextField("Chrome Web Store link, or a link to a .zip, .crx or .xpi", text: $link)
+                TextField("Chrome Web Store link, or a .zip, .crx or .xpi", text: $link)
                     .textFieldStyle(.roundedBorder)
                     .font(Design.body(12))
                     .onSubmit(installLink)
@@ -135,103 +230,46 @@ struct ExtensionManager: View {
                     .disabled(link.trimmingCharacters(in: .whitespaces).isEmpty || extensions.busy)
             }
             HStack {
-                Button("Install from File\u{2026}", action: chooseFile)
+                Button("Choose File\u{2026}", action: chooseFile)
                     .disabled(extensions.busy)
                 if extensions.busy { ProgressView().controlSize(.small) }
                 Spacer()
             }
             .controlSize(.small)
-
-            if let error = extensions.lastError {
-                Text(error)
-                    .font(Design.body(11))
-                    .foregroundStyle(Design.danger)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
             Text("Extensions run on WebKit\u{2019}s engine, the one Safari uses. Most work; ones built on Chrome-only features may load and then do nothing.")
                 .font(Design.body(11))
                 .foregroundStyle(Design.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(16)
-        .frame(width: 400)
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
     }
 
-    private func row(_ record: InstalledExtension) -> some View {
-        HStack(spacing: 10) {
-            Group {
-                if let icon = extensions.icon(of: record, size: 20) {
-                    Image(nsImage: icon).resizable().interpolation(.high)
-                } else {
-                    Image(systemName: "puzzlepiece.fill").resizable().foregroundStyle(Design.tertiary)
-                }
-            }
-            .frame(width: 20, height: 20)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(extensions.name(of: record))
-                    .font(Design.body(13, weight: .medium))
-                    .foregroundStyle(record.enabled ? Design.text : Design.secondary)
-                    .lineLimit(1)
-                if !extensions.version(of: record).isEmpty {
-                    Text(extensions.version(of: record))
-                        .font(Design.body(11))
-                        .monospacedDigit()
-                        .foregroundStyle(Design.tertiary)
-                }
-            }
-            Spacer(minLength: 0)
-
-            if extensions.context(record.id)?.optionsPageURL != nil {
-                Button("Options") { extensions.openOptions(record) }
-                    .controlSize(.small)
-            }
-            Toggle("", isOn: Binding(
-                get: { record.enabled },
-                set: { extensions.setEnabled(record, $0) }
-            ))
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            Button { extensions.remove(record) } label: {
-                Image(systemName: "trash").font(.system(size: 11))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(Design.secondary)
-            .help("Remove")
+    /// Its popup if it has one, else its options page.
+    private func open(_ record: InstalledExtension) {
+        if record.enabled, extensions.context(record.id)?.action(for: nil) != nil {
+            dismiss?()
+            // Once the menu has gone, so the popup is not shut along with it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { extensions.perform(record) }
+        } else if extensions.context(record.id)?.optionsPageURL != nil {
+            extensions.openOptions(record)
+            dismiss?()
         }
-        .padding(.vertical, 5)
     }
 
-    /// Whether it may see and run in private windows. Off by default.
-    private func privateRow(_ record: InstalledExtension) -> some View {
-        Toggle(isOn: Binding(
-            get: { record.allowedInPrivate ?? false },
-            set: { extensions.setAllowedInPrivate(record, $0) }
-        )) {
-            Text("Allow in private windows")
-                .font(Design.body(11))
-                .foregroundStyle(Design.tertiary)
-        }
-        .toggleStyle(.checkbox)
-        .controlSize(.small)
-        .padding(.leading, 30)
-        .padding(.bottom, 6)
-    }
-
-    /// For an extension that asked to read every site: where it actually runs.
-    private func sitesRow(_ record: InstalledExtension) -> some View {
-        SitesField(record: record, extensions: extensions)
-            .padding(.leading, 30)
-            .padding(.bottom, 6)
+    private func saveSites(_ record: InstalledExtension) {
+        extensions.setSites(record, sitesText.split(separator: ",").map(String.init))
+        editingSites = nil
     }
 
     private func installLink() {
         let text = link
         Task {
             await extensions.install(fromWeb: text)
-            if extensions.lastError == nil { link = "" }
+            if extensions.lastError == nil {
+                link = ""
+                adding = false
+            }
         }
     }
 
@@ -242,43 +280,138 @@ struct ExtensionManager: View {
         panel.allowsMultipleSelection = false
         panel.message = "Choose an unpacked extension folder, or a .zip, .crx or .xpi."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        Task { await extensions.install(fromFile: url) }
+        Task {
+            await extensions.install(fromFile: url)
+            if extensions.lastError == nil { adding = false }
+        }
     }
 }
 
-/// "Runs on: all sites" with a field to narrow it to a few hosts.
-private struct SitesField: View {
+/// One extension in the menu.
+private struct ExtensionRow: View {
     let record: InstalledExtension
     @ObservedObject var extensions: Extensions
-    @State private var text = ""
-    @State private var editing = false
+    let open: () -> Void
+    let editSites: () -> Void
+    let remove: () -> Void
+    @State private var hovering = false
+
+    private var context: WKWebExtensionContext? { extensions.context(record.id) }
+    private var hasPopup: Bool { record.enabled && context?.action(for: nil) != nil }
+    private var hasOptions: Bool { context?.optionsPageURL != nil }
+
+    /// "2026.9.0 · 2 sites · Private windows", short enough for one line;
+    /// the sites themselves are in the line's tooltip.
+    private var summary: String {
+        guard record.enabled else { return "Turned off" }
+        var parts: [String] = []
+        let version = extensions.version(of: record)
+        if !version.isEmpty { parts.append(version) }
+        if extensions.asksForEverySite(record) {
+            parts.append(record.sites.map { $0.count == 1 ? $0[0] : "\($0.count) sites" } ?? "All sites")
+        }
+        if record.allowedInPrivate == true { parts.append("Private windows") }
+        return parts.joined(separator: " \u{00B7} ")
+    }
 
     var body: some View {
         HStack(spacing: 6) {
-            if editing {
-                TextField("canvas.school.edu, *.instructure.com", text: $text)
-                    .textFieldStyle(.roundedBorder)
-                    .font(Design.body(11))
-                    .onSubmit(commit)
-                Button("Save", action: commit).controlSize(.small)
-                Button("All sites") { extensions.setSites(record, nil); editing = false }.controlSize(.small)
-            } else {
-                Text(record.sites.map { "Runs on \($0.joined(separator: ", "))" } ?? "Runs on all sites")
-                    .font(Design.body(11))
-                    .foregroundStyle(Design.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Button("Change\u{2026}") { text = (record.sites ?? []).joined(separator: ", "); editing = true }
-                    .buttonStyle(.plain)
-                    .font(Design.body(11))
-                    .foregroundStyle(Design.accent)
-            }
-            Spacer(minLength: 0)
-        }
-    }
+            Button(action: open) {
+                HStack(spacing: 10) {
+                    Group {
+                        if let icon = extensions.icon(of: record, size: 20) {
+                            Image(nsImage: icon).resizable().interpolation(.high)
+                        } else {
+                            Image(systemName: "puzzlepiece.fill").resizable().foregroundStyle(Design.tertiary)
+                        }
+                    }
+                    .frame(width: 20, height: 20)
+                    .saturation(record.enabled ? 1 : 0)
+                    .opacity(record.enabled ? 1 : 0.5)
 
-    private func commit() {
-        extensions.setSites(record, text.split(separator: ",").map(String.init))
-        editing = false
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(extensions.name(of: record))
+                            .font(Design.body(13, weight: .medium))
+                            .foregroundStyle(record.enabled ? Design.text : Design.secondary)
+                            .lineLimit(1)
+                        Text(summary)
+                            .font(Design.body(11))
+                            .monospacedDigit()
+                            .foregroundStyle(Design.tertiary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasPopup && !hasOptions)
+            .help([
+                extensions.name(of: record),
+                record.sites.map { "Runs only on " + $0.joined(separator: ", ") },
+                hasPopup ? "Click to open" : hasOptions ? "Click for options" : nil,
+            ].compactMap { $0 }.joined(separator: "\n"))
+
+            if hasPopup {
+                Button { extensions.setPinned(record, record.pinned == false) } label: {
+                    Image(systemName: record.pinned == false ? "pin" : "pin.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(record.pinned == false ? Design.tertiary : Design.accent)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(record.pinned == false ? "Show in Toolbar" : "Hide from Toolbar")
+            }
+
+            Toggle("", isOn: Binding(
+                get: { record.enabled },
+                set: { extensions.setEnabled(record, $0) }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .help(record.enabled ? "Turn Off" : "Turn On")
+
+            Menu {
+                if hasOptions {
+                    Button("Options") { extensions.openOptions(record) }
+                }
+                if extensions.asksForEverySite(record) {
+                    Section("Runs on") {
+                        Toggle("All Sites", isOn: Binding(
+                            get: { record.sites == nil },
+                            set: { if $0 { extensions.setSites(record, nil) } }
+                        ))
+                        Toggle("Only Some Sites\u{2026}", isOn: Binding(
+                            get: { record.sites != nil },
+                            set: { _ in editSites() }
+                        ))
+                    }
+                }
+                Toggle("Allow in Private Windows", isOn: Binding(
+                    get: { record.allowedInPrivate ?? false },
+                    set: { extensions.setAllowedInPrivate(record, $0) }
+                ))
+                Divider()
+                Button("Remove\u{2026}", role: .destructive, action: remove)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Design.secondary)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .frame(width: 24)
+            .help("More")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(hovering ? Design.hover : Color.clear)
+        }
+        .onHover { hovering = $0 }
     }
 }

@@ -32,6 +32,8 @@ final class Tab: NSObject, ObservableObject, Identifiable {
     /// Scroll position and back-forward list, held while asleep.
     private var savedState: Any?
     @Published var isPinned: Bool
+    /// The tab group it is in, if any. See `TabGroup`.
+    @Published var groupID: UUID?
     /// The colour along the top of the page, for the chrome to match.
     @Published var tint: PageTint?
     /// There is a video on the page, so the picture-in-picture button is worth showing.
@@ -53,6 +55,8 @@ final class Tab: NSObject, ObservableObject, Identifiable {
     private var tintWork: DispatchWorkItem?
     private var thumbnailInFlight = false
     private var lastThumbnail = Date.distantPast
+    /// Whether the pointer's moves reach the page; see `TabPointer.swift`.
+    var pointer = PointerWatch.Track()
     let finder = PageFind()
 
     /// A private tab keeps its cookies and storage in memory, shared only with
@@ -99,6 +103,10 @@ final class Tab: NSObject, ObservableObject, Identifiable {
         let scripts = view.configuration.userContentController
         scripts.removeScriptMessageHandler(forName: "driftActivity", contentWorld: Self.ownWorld)
         scripts.add(TabActivityBridge.shared, contentWorld: Self.ownWorld, name: "driftActivity")
+        scripts.removeScriptMessageHandler(forName: "driftPointer", contentWorld: Self.ownWorld)
+        scripts.add(TabPointerBridge.shared, contentWorld: Self.ownWorld, name: "driftPointer")
+        scripts.removeScriptMessageHandler(forName: "driftStore", contentWorld: Self.ownWorld)
+        scripts.addScriptMessageHandler(WebStoreBridge.shared, contentWorld: Self.ownWorld, name: "driftStore")
         scripts.removeScriptMessageHandler(forName: "driftLog", contentWorld: Self.ownWorld)
         scripts.add(TabLogBridge.shared, contentWorld: Self.ownWorld, name: "driftLog")
         scripts.removeScriptMessageHandler(forName: "driftFullscreen", contentWorld: Self.ownWorld)
@@ -161,6 +169,7 @@ final class Tab: NSObject, ObservableObject, Identifiable {
             configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
         }
         Self.turnOffWebGPU(configuration.preferences)
+        Self.setFeature(SteadyScrolling.feature, on: SteadyScrolling.enabled, in: configuration.preferences)
         // In a world of its own, where the page's scripts cannot reach it.
         configuration.userContentController.addUserScript(WKUserScript(
             source: TabSleep.tracker,
@@ -174,6 +183,27 @@ final class Tab: NSObject, ObservableObject, Identifiable {
             forMainFrameOnly: false,
             in: Self.ownWorld
         ))
+        // Tells Drift the page hears the pointer move; see PointerWatch.
+        configuration.userContentController.addUserScript(WKUserScript(
+            source: PointerWatch.script,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false,
+            in: Self.ownWorld
+        ))
+        // The Chrome Web Store's install button, working; see WebStore.
+        configuration.userContentController.addUserScript(WKUserScript(
+            source: WebStore.script,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true,
+            in: Self.ownWorld
+        ))
+        // Google Docs follows macOS into dark mode; see DocsDark.
+        configuration.userContentController.addUserScript(WKUserScript(
+            source: DocsDark.script,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true,
+            in: Self.ownWorld
+        ))
         // Script errors can only be heard in the page's world; they are passed
         // to Drift's as plain text.
         configuration.userContentController.addUserScript(WKUserScript(
@@ -184,6 +214,13 @@ final class Tab: NSObject, ObservableObject, Identifiable {
         ))
         configuration.userContentController.addUserScript(WKUserScript(
             source: PageLog.relayScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false,
+            in: Self.ownWorld
+        ))
+        // What became of a drag over the page; see DragWatch.
+        configuration.userContentController.addUserScript(WKUserScript(
+            source: DragWatch.script,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false,
             in: Self.ownWorld
@@ -234,19 +271,33 @@ final class Tab: NSObject, ObservableObject, Identifiable {
     /// The switch is one of WebKit's private feature flags, looked up by name;
     /// a WebKit without it leaves WebGPU as it is.
     static func turnOffWebGPU(_ preferences: WKPreferences) {
-        let setter = NSSelectorFromString("_setEnabled:forFeature:")
-        guard let feature = webGPUFeature, preferences.responds(to: setter),
-              let implementation = class_getMethodImplementation(WKPreferences.self, setter) else { return }
-        typealias SetEnabled = @convention(c) (AnyObject, Selector, Bool, AnyObject) -> Void
-        unsafeBitCast(implementation, to: SetEnabled.self)(preferences, setter, false, feature)
+        setFeature("WebGPUEnabled", on: false, in: preferences)
     }
 
-    private static let webGPUFeature: NSObject? = {
+    /// One of WebKit's switchable features, by its key. Nothing happens if
+    /// this WebKit has no such feature.
+    static func setFeature(_ key: String, on: Bool, in preferences: WKPreferences) {
+        let setter = NSSelectorFromString("_setEnabled:forFeature:")
+        guard let feature = features.first(where: { $0.value(forKey: "key") as? String == key }),
+              preferences.responds(to: setter),
+              let implementation = class_getMethodImplementation(WKPreferences.self, setter) else { return }
+        typealias SetEnabled = @convention(c) (AnyObject, Selector, Bool, AnyObject) -> Void
+        unsafeBitCast(implementation, to: SetEnabled.self)(preferences, setter, on, feature)
+    }
+
+    private static let features: [NSObject] = {
         let list = NSSelectorFromString("_features")
         guard (WKPreferences.self as AnyObject).responds(to: list),
-              let features = (WKPreferences.self as AnyObject).perform(list)?.takeUnretainedValue() as? [NSObject] else { return nil }
-        return features.first { $0.value(forKey: "key") as? String == "WebGPUEnabled" }
+              let features = (WKPreferences.self as AnyObject).perform(list)?.takeUnretainedValue() as? [NSObject] else { return [] }
+        return features
     }()
+
+    /// The Settings switch, for a page already open. It takes effect as the
+    /// page next lays itself out.
+    func setSteadyScrolling(_ on: Bool) {
+        guard let preferences = webView?.configuration.preferences else { return }
+        Self.setFeature(SteadyScrolling.feature, on: on, in: preferences)
+    }
 
     /// Brings this tab's blocking into line with the current switch and list.
     func refreshContentRules() {
@@ -354,6 +405,13 @@ final class Tab: NSObject, ObservableObject, Identifiable {
     func focus() {
         guard let webView else { return }
         webView.window?.makeFirstResponder(webView)
+    }
+
+    /// The View menu's switch, for a Google Docs page already open. Pages
+    /// opened later read the setting as they load.
+    func setDocsDark(_ on: Bool) {
+        webView?.evaluateJavaScript(DocsDark.switchScript(on: on), in: nil, in: Self.ownWorld) { _ in }
+        sampleTint(after: 0.1)
     }
 
     func takeThumbnail() {
@@ -594,6 +652,9 @@ private final class TabActivityBridge: NSObject, WKScriptMessageHandler {
 /// formatting.
 final class PageView: WKWebView {
     weak var tab: Tab?
+    /// The stand-ins that own the widened tracking areas; an area does not
+    /// keep its owner. See `widenHoverTracking`.
+    private var hoverGates: [HoverGate] = []
 
     /// ⌘V pastes text as Paste and Match Style does: no fonts, colours or
     /// sizes from wherever it was copied. A page that reads the paste itself,
@@ -629,6 +690,65 @@ final class PageView: WKWebView {
     /// only the page itself reads back.
     private static let pageWrittenType = NSPasteboard.PasteboardType("com.apple.WebKit.custom-pasteboard-data")
 
+    // MARK: - Drags, for the log
+    //
+    // AppKit's side of a drag over the page: what it carried, where from, and
+    // what WebKit answered. The page's side is `DragWatch`. Together they say
+    // where a drop that did nothing stopped.
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let answer = super.draggingEntered(sender)
+        lastDragAnswer = answer
+        tab?.note("drag", "AppKit brought a drag over the page from \(Self.describeSource(sender, page: self)), carrying \(Self.describeTypes(sender)); WebKit answered \(Self.describe(answer))")
+        return answer
+    }
+
+    /// WebKit's answer comes from the page a moment late, so a change is noted.
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let answer = super.draggingUpdated(sender)
+        if answer != lastDragAnswer {
+            lastDragAnswer = answer
+            tab?.note("drag", "WebKit now answers \(Self.describe(answer))")
+        }
+        return answer
+    }
+
+    private var lastDragAnswer: NSDragOperation?
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let done = super.performDragOperation(sender)
+        tab?.note("drag", "AppKit dropped it on the page; WebKit \(done ? "took" : "refused") the drop")
+        return done
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        super.draggingExited(sender)
+        tab?.note("drag", "AppKit took the drag off the page")
+    }
+
+    private static func describeSource(_ info: NSDraggingInfo, page: PageView) -> String {
+        guard let source = info.draggingSource else { return "another app" }
+        if (source as? NSView) === page { return "this page" }
+        if source is WKWebView { return "another page in Drift" }
+        return "Drift (\(type(of: source)))"
+    }
+
+    private static func describeTypes(_ info: NSDraggingInfo) -> String {
+        let types = info.draggingPasteboard.types?.map(\.rawValue) ?? []
+        let notable = types.filter { !$0.hasPrefix("dyn.") && !$0.hasPrefix("CorePasteboardFlavorType") }
+        return notable.isEmpty ? "nothing readable" : notable.prefix(8).joined(separator: ", ") + (notable.count > 8 ? " and \(notable.count - 8) more" : "")
+    }
+
+    private static func describe(_ operation: NSDragOperation) -> String {
+        if operation.isEmpty { return "no (nothing would happen on a drop)" }
+        var parts: [String] = []
+        if operation.contains(.copy) { parts.append("copy") }
+        if operation.contains(.move) { parts.append("move") }
+        if operation.contains(.link) { parts.append("link") }
+        if operation.contains(.generic) { parts.append("generic") }
+        return parts.isEmpty ? "\(operation.rawValue)" : parts.joined(separator: "+")
+    }
+
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
         super.willOpenMenu(menu, with: event)
         guard let tab else { return }
@@ -645,27 +765,122 @@ final class PageView: WKWebView {
     // is not the active window — intermittent, since it depends on which window
     // is key. Safari-like browsers broaden that area to stay active always; do
     // the same, every time WebKit rebuilds its tracking (on resize, re-parent,
-    // navigation). Owner and userInfo are kept, so WebKit still gets the moves.
+    // navigation). WebKit still gets the moves, through a `HoverGate`.
+    //
+    // With a mouse plugged in, so that scroll bars always show, WebKit makes
+    // its area active always by itself. It is gated all the same.
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         // After WebKit has rebuilt its own areas for this layout pass.
         DispatchQueue.main.async { [weak self] in self?.widenHoverTracking() }
     }
 
+    /// WebKit's own pointer-tracking areas, each with the gated stand-in that
+    /// went into the view in its place.
+    private var standIns: [(webKits: NSTrackingArea, standIn: NSTrackingArea)] = []
+
+    // WebKit makes its area again from time to time (when the scroll bar
+    // style is settled, for one), on this view. It is swapped for a gated
+    // stand-in as it arrives, and taking it away takes the stand-in.
+    override func addTrackingArea(_ area: NSTrackingArea) {
+        guard area.options.contains(.mouseMoved), let owner = area.owner as? NSObject,
+              NSStringFromClass(type(of: owner)).contains("MouseTrackingObserver") else {
+            return super.addTrackingArea(area)
+        }
+        let gate = HoverGate(passingTo: owner, page: self)
+        hoverGates.append(gate)
+        let standIn = NSTrackingArea(
+            rect: area.rect,
+            options: area.options.subtracting(.activeInKeyWindow).union(.activeAlways),
+            owner: gate,
+            userInfo: area.userInfo)
+        standIns.append((area, standIn))
+        super.addTrackingArea(standIn)
+    }
+
+    override func removeTrackingArea(_ area: NSTrackingArea) {
+        if let index = standIns.firstIndex(where: { $0.webKits === area }) {
+            let standIn = standIns.remove(at: index).standIn
+            hoverGates.removeAll { gate in standIn.owner === gate }
+            return super.removeTrackingArea(standIn)
+        }
+        super.removeTrackingArea(area)
+    }
+
     private func widenHoverTracking() {
         func widen(_ view: NSView) {
-            for area in view.trackingAreas
-            where area.options.contains(.mouseMoved) && area.options.contains(.activeInKeyWindow) {
+            for area in view.trackingAreas where area.options.contains(.mouseMoved) {
+                guard let owner = area.owner as? NSObject, !(owner is HoverGate) else { continue }
+                // WebKit's own pointer tracking. Any other owner (tool tips)
+                // keeps its area, only widened.
+                let isWebKits = NSStringFromClass(type(of: owner)).contains("MouseTrackingObserver")
+                guard isWebKits || area.options.contains(.activeInKeyWindow) else { continue }
+                let newOwner: NSObject
+                if isWebKits {
+                    // WebKit made a new area, as it does when the scroll bar
+                    // style changes; the gated copy of its old one goes.
+                    for old in view.trackingAreas {
+                        if let gate = old.owner as? HoverGate, gate.isPassing(to: owner) { view.removeTrackingArea(old) }
+                    }
+                    hoverGates.removeAll { $0.isPassing(to: owner) }
+                    let gate = HoverGate(passingTo: owner, page: self)
+                    hoverGates.append(gate)
+                    newOwner = gate
+                } else {
+                    newOwner = owner
+                }
                 view.removeTrackingArea(area)
                 view.addTrackingArea(NSTrackingArea(
                     rect: area.rect,
                     options: area.options.subtracting(.activeInKeyWindow).union(.activeAlways),
-                    owner: area.owner,
+                    owner: newOwner,
                     userInfo: area.userInfo))
             }
             view.subviews.forEach(widen)
         }
         widen(self)
+    }
+
+    /// Whether the page draws, as WebKit decides it: in a window that is on
+    /// screen, on the current Space, and not covered, and not itself hidden.
+    var isInSight: Bool {
+        guard let window, window.isVisible, window.occlusionState.contains(.visible) else { return false }
+        return !isHiddenOrHasHiddenAncestor
+    }
+}
+
+/// Owns a widened tracking area and hands its moves to WebKit, but only while
+/// the page draws.
+///
+/// WebKit answers a hover move only once the page has drawn again, and holds
+/// every later move, clicks included, until that answer comes. A page that
+/// does not draw cannot answer. Widened tracking still reports moves from a
+/// window macOS has put out of sight, such as full-screen YouTube on a Space
+/// the user has left. The first such move then waited unanswered, and coming
+/// back, the page heard nothing: no controls on hover, and the cursor YouTube
+/// hides during playback stayed hidden.
+final class HoverGate: NSObject {
+    private weak var target: NSObject?
+    private weak var page: PageView?
+
+    init(passingTo target: NSObject, page: PageView) {
+        self.target = target
+        self.page = page
+    }
+
+    func isPassing(to owner: NSObject) -> Bool { target === owner }
+
+    @objc func mouseMoved(_ event: NSEvent) { pass(#selector(NSResponder.mouseMoved(with:)), event, gated: true) }
+    @objc func mouseEntered(_ event: NSEvent) { pass(#selector(NSResponder.mouseEntered(with:)), event, gated: true) }
+    @objc func mouseExited(_ event: NSEvent) { pass(#selector(NSResponder.mouseExited(with:)), event, gated: true) }
+    @objc func cursorUpdate(_ event: NSEvent) { pass(#selector(NSResponder.cursorUpdate(with:)), event, gated: false) }
+
+    private func pass(_ selector: Selector, _ event: NSEvent, gated: Bool) {
+        guard let target, target.responds(to: selector) else { return }
+        if gated {
+            guard let page, page.isInSight else { return }
+        }
+        _ = target.perform(selector, with: event)
     }
 }
 
