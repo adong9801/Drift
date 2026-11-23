@@ -23,8 +23,16 @@ swiftc \
   -o "$APP/Contents/MacOS/Drift" \
   $(find "$ROOT/Sources" -name '*.swift' | sort)
 
-# Ad-hoc signature. Camera, microphone and location grants are tied to it, so
-# macOS asks again after a rebuild.
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+# Signed with the "Drift Local Signing" certificate when this Mac has one
+# (Support/make-signing-cert.sh makes it): every build then carries the same
+# signature, so what was granted to Drift (Accessibility, camera, microphone,
+# location) carries over to the next. Otherwise ad-hoc, which macOS takes for
+# a new app after each rebuild, so it asks again.
+IDENTITY="Drift Local Signing"
+if security find-identity -p codesigning | grep -q "\"$IDENTITY\""; then
+  codesign --force --sign "$IDENTITY" "$APP"
+else
+  codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+fi
 
 echo "built: $APP"

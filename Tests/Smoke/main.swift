@@ -46,6 +46,39 @@ final class KeyableWindow: NSWindow {
     override var canBecomeKey: Bool { true }
 }
 
+/// Stands in for the system's picture-in-picture panel, which has the same
+/// kind of name, without opening picture in picture.
+@objc(PIPSmokePanel) final class PIPSmokePanel: NSPanel {}
+
+/// A drag as the screenshot thumbnail gives one: from another app, with the
+/// file already on disk and a promise of it besides. No real drag is made.
+final class ShotDrag: NSObject, NSDraggingInfo {
+    let draggingPasteboard: NSPasteboard
+    let draggingLocation: NSPoint
+    weak var draggingDestinationWindow: NSWindow?
+    init(file: URL, at location: NSPoint, in window: NSWindow?) {
+        draggingPasteboard = NSPasteboard(name: NSPasteboard.Name("drift-smoke-shot-drag"))
+        draggingPasteboard.clearContents()
+        draggingPasteboard.writeObjects([file as NSURL])
+        draggingPasteboard.setPropertyList([file.path], forType: NSPasteboard.PasteboardType("NSFilenamesPboardType"))
+        draggingPasteboard.setPropertyList(["public.png"], forType: FileDrop.promiseType)
+        draggingLocation = location
+        draggingDestinationWindow = window
+    }
+    var draggingSourceOperationMask: NSDragOperation { [.copy, .generic] }
+    var draggedImageLocation: NSPoint { draggingLocation }
+    var draggedImage: NSImage? { nil }
+    var draggingSource: Any? { nil }
+    var draggingSequenceNumber: Int { 4245 }
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+    var draggingFormation: NSDraggingFormation = .default
+    var animatesToDestination = false
+    var numberOfValidItemsForDrop = 1
+    func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions = [], for view: NSView?, classes classArray: [AnyClass], searchOptions: [NSPasteboard.ReadingOptionKey: Any] = [:], using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+    var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+    func resetSpringLoading() {}
+}
+
 MainActor.assumeIsolated {
     let app = NSApplication.shared
     app.setActivationPolicy(.prohibited)
@@ -145,6 +178,177 @@ MainActor.assumeIsolated {
           fsResult.contains("\"yt\":true"))
     fsView.removeFromSuperview()
 
+    // WebKit cannot switch a media buffer from MP4 to WebM, which YouTube
+    // does for some accounts, leaving a grey box; see YouTubeFormats.
+    print("youtube formats")
+    do {
+        let probe = """
+        JSON.stringify({ host: location.hostname, webmVideo: MediaSource.isTypeSupported('video/webm; codecs="vp09.00.10.08"'),
+          webmAudio: MediaSource.isTypeSupported('audio/webm; codecs="opus"'),
+          mp4: MediaSource.isTypeSupported('video/mp4; codecs="avc1.4d401f"'),
+          canPlay: document.createElement('video').canPlayType('video/webm; codecs="vp9"') })
+        """
+        @MainActor func formats(at base: String) -> [String: Any] {
+            let expected = URL(string: base)!.host!
+            let view = WKWebView(frame: CGRect(x: 0, y: 0, width: 400, height: 300), configuration: Tab.makeConfiguration())
+            host.addSubview(view)
+            defer { view.removeFromSuperview() }
+            view.loadHTMLString("<!doctype html><title>formats</title>", baseURL: URL(string: base)!)
+            var answer: [String: Any] = [:]
+            spin(10) {
+                view.evaluateJavaScript(probe) { value, _ in
+                    // Not the blank page the view holds until this one is in.
+                    if let text = value as? String, let data = text.data(using: .utf8),
+                       let found = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                       found["host"] as? String == expected {
+                        answer = found
+                    }
+                }
+                return !answer.isEmpty
+            }
+            return answer
+        }
+        let youtube = formats(at: "https://www.youtube.com/watch?v=x")
+        check("YouTube is told WebM video will not play, so it streams MP4",
+              youtube["webmVideo"] as? Bool == false && youtube["canPlay"] as? String == "")
+        check("and keeps its WebM audio and MP4 video", youtube["webmAudio"] as? Bool == true && youtube["mp4"] as? Bool == true)
+        let elsewhere = formats(at: "https://example.test/")
+        check("any other site still gets WebM video", elsewhere["webmVideo"] as? Bool == true)
+
+        // Handed the start of an AV1 stream in a buffer made for H.264, with
+        // no changeType, WebKit turns it down and YouTube starts its player
+        // again. The script makes the changeType. Each start is an
+        // initialisation segment's outline, enough to name its codec.
+        let switching = """
+        function start(codec) {
+          var bytes = [0,0,0,16]; 'ftypisom'.split('').forEach(function (c) { bytes.push(c.charCodeAt(0)); }); bytes.push(0,0,0,0);
+          bytes.push(0,0,0,24); 'stsd'.split('').forEach(function (c) { bytes.push(c.charCodeAt(0)); });
+          bytes.push(0,0,0,0, 0,0,0,1, 0,0,0,8); codec.split('').forEach(function (c) { bytes.push(c.charCodeAt(0)); });
+          return new Uint8Array(bytes);
+        }
+        async function changesFor(codec) {
+          var video = document.createElement('video');
+          document.body.appendChild(video);
+          var source = new MediaSource();
+          video.src = URL.createObjectURL(source);
+          await new Promise(function (done) { source.addEventListener('sourceopen', done, { once: true }); });
+          var made = [];
+          var own = SourceBuffer.prototype.changeType;
+          SourceBuffer.prototype.changeType = function (type) { made.push(type); return own.apply(this, arguments); };
+          try {
+            source.addSourceBuffer('video/mp4; codecs="avc1.640028"').appendBuffer(start(codec));
+          } finally {
+            SourceBuffer.prototype.changeType = own;
+          }
+          return made;
+        }
+        return JSON.stringify({ host: location.hostname, av1: await changesFor('av01'), h264: await changesFor('avc1') });
+        """
+        @MainActor func codecSwitch(at base: String) -> [String: Any] {
+            let expected = URL(string: base)!.host!
+            let view = WKWebView(frame: CGRect(x: 0, y: 0, width: 400, height: 300), configuration: Tab.makeConfiguration())
+            host.addSubview(view)
+            defer { view.removeFromSuperview() }
+            view.loadHTMLString("<!doctype html><title>switch</title><body></body>", baseURL: URL(string: base)!)
+            // Not the blank page the view holds until this one is in.
+            var arrived = false
+            spin(10) {
+                view.evaluateJavaScript("location.hostname") { value, _ in arrived = arrived || value as? String == expected }
+                return arrived
+            }
+            var answer: [String: Any] = [:]
+            var finished = false
+            view.callAsyncJavaScript(switching, arguments: [:], in: nil, in: .page) { result in
+                finished = true
+                if case .success(let value) = result, let text = value as? String, let data = text.data(using: .utf8),
+                   let found = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                   found["host"] as? String == expected {
+                    answer = found
+                }
+            }
+            spin(10) { finished }
+            return answer
+        }
+        let onYouTube = codecSwitch(at: "https://www.youtube.com/watch?v=x")
+        check("on YouTube an AV1 start in an H.264 buffer gets its changeType first",
+              (onYouTube["av1"] as? [String])?.count == 1 && (onYouTube["av1"] as? [String])?.first?.contains("av01") == true)
+        check("and more H.264 in an H.264 buffer gets none", (onYouTube["h264"] as? [String])?.isEmpty == true)
+        let offYouTube = codecSwitch(at: "https://example.test/")
+        check("other sites' buffers are left to them", (offYouTube["av1"] as? [String])?.isEmpty == true)
+    }
+
+    // WebKit's Copy Image puts the image's address beside it, which a
+    // message box such as Instagram's pastes instead of the picture; see
+    // CopyImage. On a clipboard of the test's own, never the user's.
+    print("copy image")
+    do {
+        let board = NSPasteboard(name: NSPasteboard.Name("local.prototype.drift.smoke.copy-image"))
+        CopyImage.pasteboard = { board }
+        defer { CopyImage.pasteboard = { .general }; board.releaseGlobally() }
+        let picture = NSImage(size: NSSize(width: 4, height: 3), flipped: false) { rect in
+            NSColor.systemRed.setFill(); rect.fill(); return true
+        }
+        let tiff = picture.tiffRepresentation!
+
+        /// Writes what WebKit's Copy Image writes, in its order and from the
+        /// next turn of the run loop, as the page's process does.
+        final class FakeWebKit: NSObject {
+            let board: NSPasteboard
+            let tiff: Data
+            var handed: Any?
+            init(board: NSPasteboard, tiff: Data) { self.board = board; self.tiff = tiff }
+            @objc func forwardContextMenuAction(_ sender: Any?) {
+                handed = sender
+                DispatchQueue.main.async { [self] in
+                    let address = "https://scontent.example.test/v/photo.png?oh=1&oe=2"
+                    board.declareTypes([.tiff, .URL, .string, .rtfd], owner: nil)
+                    board.setString(address, forType: .URL)
+                    board.setString(address, forType: .string)
+                    board.setData(tiff, forType: .tiff)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [self] in
+                        board.setData(Data("{\\rtf1}".utf8), forType: .rtfd)
+                    }
+                }
+            }
+        }
+        let webKit = FakeWebKit(board: board, tiff: tiff)
+        let menu = NSMenu()
+        let copyItem = NSMenuItem(title: "Copy Image", action: #selector(FakeWebKit.forwardContextMenuAction(_:)), keyEquivalent: "")
+        copyItem.identifier = CopyImage.identifier
+        copyItem.target = webKit
+        let addressItem = NSMenuItem(title: "Copy Image Address", action: #selector(FakeWebKit.forwardContextMenuAction(_:)), keyEquivalent: "")
+        addressItem.target = webKit
+        menu.addItem(copyItem)
+        menu.addItem(addressItem)
+        CopyImage.adopt(menu)
+        check("the menu's other items are left as WebKit made them", addressItem.target === webKit)
+        if let action = copyItem.action { NSApp.sendAction(action, to: copyItem.target, from: copyItem) }
+        check("WebKit's own Copy Image still does the copying, handed the item", webKit.handed as? NSMenuItem === copyItem)
+        // Each type is listed under its old name as well; asked by the new.
+        func only(_ kept: [NSPasteboard.PasteboardType]) -> Bool {
+            let all: [NSPasteboard.PasteboardType] = [.png, .tiff, .string, .URL, .rtfd, .html, NSPasteboard.PasteboardType("com.apple.webarchive")]
+            return all.allSatisfy { (board.availableType(from: [$0]) != nil) == kept.contains($0) }
+        }
+        spin(3) { only([.png, .tiff]) }
+        check("Copy Image leaves the picture alone on the clipboard, no address", only([.png, .tiff]))
+        let png = board.data(forType: .png).flatMap { NSBitmapImageRep(data: $0) }
+        check("as a PNG of the same picture", png?.pixelsWide == 4 && png?.pixelsHigh == 3)
+
+        // Copied from elsewhere: no address beside it, or no picture.
+        board.clearContents()
+        board.setData(tiff, forType: .tiff)
+        var trimmed = false
+        CopyImage.trim(board) { trimmed = true }
+        spin(2) { trimmed }
+        check("a screenshot, with no address, is left as it was", only([.tiff]))
+        board.clearContents()
+        board.setString("https://example.test/", forType: .string)
+        trimmed = false
+        CopyImage.trim(board) { trimmed = true }
+        spin(2) { trimmed }
+        check("so is a copied address", board.string(forType: .string) == "https://example.test/")
+    }
+
     print("tabs")
     let second = store.newTab(URL(string: "https://www.iana.org/help/example-domains")!)
     spin(20) { !second.isLoading && !second.title.isEmpty }
@@ -218,6 +422,19 @@ MainActor.assumeIsolated {
     check("scrolled to where it was left", leftAt > 0 && abs(offset - leftAt) < 2)
     print("       left at \(Int(leftAt)), woke at \(Int(offset))")
 
+    // A memory warning from the system comes a few times an hour on a busy
+    // Mac and is about the whole machine: it keeps to the user's wait.
+    do {
+        let key = "drift.sleepMinutes.v1"
+        let saved = UserDefaults.standard.object(forKey: key)
+        UserDefaults.standard.set(30, forKey: key)
+        first.lastActive = Date().addingTimeInterval(-5 * 60)
+        store.memoryPressureChanged(critical: false)
+        spin(1.5)
+        check("a memory warning leaves awake a tab left five minutes ago", !first.isAsleep && !store.isVisible(first))
+        if let saved { UserDefaults.standard.set(saved, forKey: key) } else { UserDefaults.standard.removeObject(forKey: key) }
+    }
+
     print("split view")
     store.toggleSplit()
     check("split brings the last tab alongside", store.split?.id == first.id && store.focusedPane == .secondary)
@@ -226,6 +443,11 @@ MainActor.assumeIsolated {
           first.webView?.superview != nil && second.webView?.superview != nil
           && first.webView?.superview !== second.webView?.superview)
     shot("split")
+    first.lastActive = .distantPast
+    store.toggleSplit()
+    check("closing the split starts the idle time of the tab it put away", !store.isVisible(first) && Date().timeIntervalSince(first.lastActive) < 5)
+    store.toggleSplit()
+    check("and split brings it back", store.split?.id == first.id)
     store.close(second)
     check("closing the left page promotes the right", store.selected?.id == first.id && store.split == nil)
     store.reopenClosed()
@@ -464,6 +686,20 @@ MainActor.assumeIsolated {
     let startIndex = store.switcher?.index ?? -1
     store.moveSwitcherRow(down: true)
     check("Down moves to the row beneath, same column", store.switcher?.index == SwitcherGrid.jumpRow(from: startIndex, count: 7, down: true) && store.switcher?.index != startIndex)
+    // A card sliding under a pointer that stays put, as when the overlay
+    // opens or scrolls, is not the pointer choosing it.
+    do {
+        BrowserStore.pointerLocation = { CGPoint(x: 400, y: 300) }
+        store.moveSwitcherRow(down: false)
+        let keyed = store.switcher?.index ?? 0
+        let other = keyed == 0 ? 1 : 0
+        store.pointerEnteredSwitcherCard(other)
+        check("a card that comes under a still pointer does not take the highlight from the keys", store.switcher?.index == keyed)
+        BrowserStore.pointerLocation = { CGPoint(x: 460, y: 300) }
+        store.pointerEnteredSwitcherCard(other)
+        check("one the pointer moves onto does", store.switcher?.index == other)
+        BrowserStore.pointerLocation = { NSEvent.mouseLocation }
+    }
     spin(0.4)
     shot("switcher-grid")
     // W in the overlay, through the real key path, with Control still held.
@@ -587,6 +823,33 @@ MainActor.assumeIsolated {
     check("the middle button is not Drift's to take", !store.mouseButton(2))
     store.close(walker)
 
+    print("dropping a screenshot")
+    // WebKit takes a promise of a file over the file itself, and waits for the
+    // other app to write it again; a hand-over that once never ended left the
+    // drag holding the whole screen. A file already written goes in as itself.
+    let shotFolder = URL(fileURLWithPath: out).appendingPathComponent("NSIRD_smoke", isDirectory: true)
+    try? FileManager.default.createDirectory(at: shotFolder, withIntermediateDirectories: true)
+    let shotFile = shotFolder.appendingPathComponent("Screenshot smoke.png")
+    let shotImage = NSImage(size: NSSize(width: 20, height: 20), flipped: false) { r in NSColor.systemTeal.setFill(); r.fill(); return true }
+    try? NSBitmapImageRep(data: shotImage.tiffRepresentation!)?.representation(using: .png, properties: [:])?.write(to: shotFile)
+    let dropTab = store.newTab(URL(string: "data:text/html,%3Ctitle%3EDrop%3C/title%3E%3Cbody%20style%3D%22height%3A100vh%22%20ondragover%3D%22event.preventDefault()%22%20ondrop%3D%22event.preventDefault()%3Bwindow.got%3DArray.prototype.map.call(event.dataTransfer.files%2Cf%3D%3Ef.name%2B'%3A'%2Bf.size).join()%22%3E")!)
+    spin(10) { !dropTab.isLoading && dropTab.title == "Drop" }
+    if let page = dropTab.webView {
+        let drag = ShotDrag(file: shotFile, at: page.convert(NSPoint(x: page.bounds.midX, y: page.bounds.midY), to: nil), in: page.window)
+        _ = page.draggingEntered(drag)
+        spin(0.3)
+        _ = page.draggingUpdated(drag)
+        spin(0.3)
+        let took = page.performDragOperation(drag)
+        page.concludeDragOperation(drag)
+        spin(5) { ask(dropTab, "String(window.got || '')") != "" }
+        let got = ask(dropTab, "String(window.got || '')")
+        check("a screenshot dropped on a page arrives as its file, with no hand-over to wait on", took && got.hasPrefix("Screenshot smoke.png:") && !got.hasSuffix(":0"))
+    } else {
+        check("a screenshot dropped on a page arrives as its file, with no hand-over to wait on", false)
+    }
+    store.close(dropTab)
+
     print("waking a sleeping tab")
     // A switch is a cut: the woken page is there at once, as the window's
     // colour until it paints, with nothing of the last page showing. The last
@@ -684,6 +947,38 @@ MainActor.assumeIsolated {
     check("back in full screen for the last check", store.fullscreenTab === fsTab)
     store.close(fsTab)
     check("closing the tab in full screen ends it, with no ghost left on show", store.fullscreenTab == nil && !fsTab.isPageFullscreen && !store.tabs.contains { $0 === fsTab })
+
+    // Cmd-Tab with a video in picture in picture: its panel is on every
+    // Space, so it must not count as Drift being in sight there.
+    print("coming forward with picture in picture up")
+    do {
+        let panel = PIPSmokePanel(contentRect: NSRect(x: 0, y: 0, width: 376, height: 193), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.alphaValue = 0
+        panel.ignoresMouseEvents = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.orderFrontRegardless()
+        check("the picture-in-picture panel is not taken for the browser being in sight", BrowserStore.isOnEverySpace(panel))
+        check("the browser window is", store.window.map { !BrowserStore.isOnEverySpace($0) } == true)
+        panel.orderOut(nil)
+    }
+
+    // The free drag finds the picture-in-picture window by its process: the
+    // owner's name is a display name, "Picture in Picture" in English.
+    print("finding the picture-in-picture window")
+    do {
+        func listed(_ owner: String, _ pid: pid_t, alpha: Double = 1, x: CGFloat) -> [String: Any] {
+            [kCGWindowOwnerName as String: owner, kCGWindowOwnerPID as String: pid, kCGWindowAlpha as String: alpha,
+             kCGWindowBounds as String: ["X": x, "Y": 600, "Width": 376, "Height": 212] as [String: CGFloat]]
+        }
+        let agent: pid_t = 4242
+        let found = PiPDrag.pictureInPictureWindows(in: [
+            listed("Picture in Picture", agent, x: 1100),
+            listed("PIPAgent", 77, x: 100),
+            listed("Picture in Picture", agent, alpha: 0, x: 500),
+        ], isAgent: { $0 == agent })
+        check("it is the agent's window, whatever its owner is called", found.map(\.frame) == [CGRect(x: 1100, y: 600, width: 376, height: 212)] && found.first?.owner == agent)
+        check("and a process that is not the agent is not taken for it", !PiPDrag.isAgent(getpid()) && !PiPDrag.isAgent(1))
+    }
 
     if !mediaChecks {
         print("video: skipped, since it plays sound and opens picture in picture (DRIFT_SMOKE_MEDIA=1 runs it)")
@@ -807,6 +1102,30 @@ MainActor.assumeIsolated {
         check("it gets a toolbar button with a popup",
               extensions.actionable.count == 1 && ubol.flatMap { extensions.context($0.id) }?.action(for: probe)?.presentsPopup == true)
         check("extensions are told about the tabs", ubol.flatMap { extensions.context($0.id) }?.openTabs.count == store.tabs.count)
+        if let ubol {
+            check("a newly installed extension starts unpinned, so the toolbar holds only what was chosen", !ubol.isPinned && extensions.toolbar.isEmpty)
+            extensions.setPinned(ubol, true)
+            check("pinning it puts its button in the toolbar", extensions.toolbar.map(\.id) == [ubol.id])
+            check("and is remembered on disk", Storage.load([InstalledExtension].self, from: "extensions.json")?.first { $0.id == ubol.id }?.pinned == true)
+            extensions.setPinned(ubol, false)
+            check("unpinning takes it out again", extensions.toolbar.isEmpty)
+
+            // Where its popup hangs, with the top bar showing.
+            let hadSidebar = store.sidebarVisible
+            store.sidebarVisible = false
+            extensions.setPinned(ubol, true)
+            spin(1)
+            let ownButton = extensions.popupAnchor(for: ubol.id)
+            let puzzle = extensions.popupAnchor(for: Extensions.menuAnchor)
+            check("a pinned extension's popup hangs off its own button", ownButton != nil && puzzle != nil && ownButton !== puzzle)
+            extensions.setPinned(ubol, false)
+            spin(1)
+            check("unpinned, it hangs off the extensions button, not the window's corner", puzzle != nil && extensions.popupAnchor(for: ubol.id) === puzzle)
+            store.sidebarVisible = hadSidebar
+            spin(0.5)
+        }
+        check("one saved before pinning could be chosen stays pinned",
+              (try? JSONDecoder().decode(InstalledExtension.self, from: Data(#"{"id":"x","enabled":true}"#.utf8)))?.isPinned == true)
         var verdict = ""
         spin(40) { verdict = adRequest(in: probe); return verdict == "blocked" }
         check("and then the same ad request is blocked", verdict == "blocked")
@@ -1062,6 +1381,126 @@ MainActor.assumeIsolated {
         store.ungroup(group.id)
         check("ungrouping keeps the tab and drops the group", store.tab(grouped.id) != nil && store.groups.isEmpty && grouped.groupID == nil)
         store.close(grouped)
+    }
+
+    print("history page")
+    do {
+        /// The answer of an async script, awaited.
+        @MainActor func await_(_ tab: Tab, _ body: String, in world: WKContentWorld = .page) -> String {
+            var answer: String?
+            tab.webView?.callAsyncJavaScript(body, arguments: [:], in: nil, in: world) { result in
+                switch result {
+                case .success(let value): answer = "\(value)"
+                case .failure(let error): answer = "error: \(error.localizedDescription)"
+                }
+            }
+            spin(8) { answer != nil }
+            return answer ?? "no answer"
+        }
+
+        // The model: a page once a day, newest first, taken out by the day.
+        var model = History()
+        let noon = Calendar.current.date(bySettingHour: 12, minute: 0, second: 0, of: Date())!
+        let day: TimeInterval = 86_400
+        let a = "https://a.test/", b = "https://b.test/page"
+        model.record(url: URL(string: a)!, title: "A", now: noon - 2 * day)
+        model.record(url: URL(string: a)!, title: "A", now: noon - 3600)
+        model.record(url: URL(string: a)!, title: "A", now: noon)
+        model.record(url: URL(string: b)!, title: "B", now: noon - 60)
+        check("a page visited twice in a day is listed once that day, at the later visit",
+              model.entries[a]?.days == [noon - 2 * day, noon])
+        let listed = model.visits(limit: 10)
+        check("visits come newest first, a page once a day", listed.map(\.url) == [a, b, a] && listed.first?.time == noon)
+        let firstTwo = model.visits(limit: 2)
+        let rest = model.visits(after: (firstTwo[1].stamp, firstTwo[1].url), limit: 10)
+        check("the next lot carries on where the last left off", rest.map(\.url) == [a] && rest.first?.time == noon - 2 * day)
+        check("searching keeps pages with every word in them", model.visits(matching: "b.test page", limit: 10).map(\.url) == [b])
+        model.remove(visits: [(a, noon - 1)])
+        check("removing a page's day keeps its other days", model.entries[a]?.days == [noon - 2 * day] && model.entries[a]?.lastVisit == noon - 2 * day)
+        model.remove(visits: [(b, noon)])
+        check("removing a page's only day forgets the page", model.entries[b] == nil)
+        model.record(url: URL(string: b)!, title: "B", now: noon)
+        model.remove(since: noon - 3600)
+        check("clearing the last hour leaves what came before", model.entries[b] == nil && model.entries[a]?.days == [noon - 2 * day])
+        let older = #"{"entries":{"https://a.test/":{"url":"https://a.test/","title":"A","lastVisit":700000000,"visits":3}}}"#
+        check("history saved before days were kept lists each page at its last visit",
+              (try? JSONDecoder().decode(History.self, from: Data(older.utf8)))?.entries[a]?.days == [Date(timeIntervalSinceReferenceDate: 700_000_000)])
+
+        // The page itself, in a tab, from what this run has visited.
+        let before = store.tabs.count
+        store.showHistory()
+        guard let page = store.selected, HistoryPage.isPage(page.url) else { check("Command-Y opens the History page", false); throw CancellationError() }
+        spin(10) { ask(page, "document.querySelectorAll('.row').length") != "0" }
+        check("Command-Y opens the History page in a tab", store.tabs.count == before + 1 && page.title == "History" && page.favicon != nil)
+        let firstDay = ask(page, "(document.querySelector('.day h2') || {}).textContent")
+        print("       \(firstDay); \(ask(page, "document.querySelectorAll('.row').length")) rows")
+        check("it lists this run's pages under today", firstDay.hasPrefix("Today - ") && ask(page, "String(!!document.querySelector('a.page[href=\"https://example.com/\"]'))") == "true")
+        store.showHistory()
+        check("and Command-Y again goes back to it rather than opening another", store.tabs.count == before + 1 && store.selected === page)
+        shot("history")
+
+        spin(4) { ask(page, "String(Array.prototype.every.call(document.querySelectorAll('img.icon'), function (i) { return i.complete; }))") == "true" }
+        let icons = ask(page, "JSON.stringify([document.querySelectorAll('img.icon').length, Array.prototype.filter.call(document.querySelectorAll('img.icon'), function (i) { return i.naturalWidth > 0; }).length, document.querySelectorAll('.letter').length])")
+        print("       icons [img, drawn, letters]: \(icons)")
+        let iconCounts = (try? JSONDecoder().decode([Int].self, from: Data(icons.utf8))) ?? [0, 0, 0]
+        check("site icons Drift has kept are shown, and a letter for the rest", iconCounts[1] > 0 && iconCounts[0] == iconCounts[1])
+
+        _ = ask(page, "var s = document.getElementById('search'); s.value = 'iana'; s.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' })); 'ok'")
+        spin(5) { ask(page, "location.search") == "?q=iana" && ask(page, "document.querySelectorAll('.row').length") != "0" }
+        check("searching lists only the pages that match, and the address says so",
+              ask(page, "String(Array.prototype.every.call(document.querySelectorAll('.row'), function (r) { return /iana/.test(r.dataset.url + r.textContent); }))") == "true"
+              && page.url?.absoluteString == "drift://history/?q=iana")
+        _ = ask(page, "var s = document.getElementById('search'); s.value = ''; s.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' })); 'ok'")
+        spin(5) { ask(page, "location.search") == "" && ask(page, "document.querySelectorAll('.row').length") != "0" }
+
+        let rowsBefore = Int(ask(page, "document.querySelectorAll('.row').length")) ?? 0
+        let target = ask(page, "document.querySelector('.row').dataset.url")
+        _ = ask(page, "document.querySelector('.row .more').click(); 'ok'")
+        check("a row's menu offers more from the site and removing it", ask(page, "String(!document.getElementById('menu').hidden)") == "true")
+        _ = ask(page, "document.querySelector('#menu [data-act=remove]').click(); 'ok'")
+        spin(3) { Int(ask(page, "document.querySelectorAll('.row').length")) == rowsBefore - 1 }
+        let removedToday = store.history.entries[target]?.days.contains { Calendar.current.isDateInToday($0) } != true
+        check("Remove from history takes it off the page and out of history", Int(ask(page, "document.querySelectorAll('.row').length")) == rowsBefore - 1 && removedToday)
+
+        _ = ask(page, "var boxes = document.querySelectorAll('.row input'); boxes[0].click(); boxes[2].dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true })); boxes[2].checked = true; 'ok'")
+        spin(1)
+        check("ticking one box and shift-ticking another selects the run between, and the bar says how many",
+              ask(page, "document.querySelectorAll('.row.chosen').length") == "3" && ask(page, "document.getElementById('count').textContent") == "3 selected")
+        _ = ask(page, "document.getElementById('selection-cancel').click(); 'ok'")
+        check("and Cancel lets them go", ask(page, "document.querySelectorAll('.row.chosen').length") == "0")
+
+        // Out of reach of websites.
+        let site = store.newTab(URL(string: "https://example.com/")!)
+        spin(20) { !site.isLoading && !site.title.isEmpty }
+        check("a website cannot see the History page's line to Drift",
+              ask(site, "String(typeof ((window.webkit || {}).messageHandlers || {}).driftHistory)") == "undefined")
+        check("nor reach it from Drift's own world on that page",
+              await_(site, "try { await window.webkit.messageHandlers.driftHistory.postMessage({ op: 'query', text: '', limit: 5 }); return 'answered'; } catch (e) { return 'refused'; }", in: Tab.ownWorld) == "refused")
+        let keptIcon = (try? FileManager.default.contentsOfDirectory(atPath: Storage.directory.appendingPathComponent("favicons").path))?.first ?? "example.com"
+        check("nor load the icons Drift has kept, which would say where the user had been",
+              await_(site, "return await new Promise(function (done) { var i = new Image(); i.onload = function () { done('loaded'); }; i.onerror = function () { done('refused'); }; i.src = 'drift://history/icon/\(keptIcon)'; setTimeout(function () { done('timeout'); }, 4000); });") == "refused")
+        check("nor fetch the page",
+              await_(site, "try { await fetch('drift://history/'); return 'fetched'; } catch (e) { return 'refused'; }") == "refused")
+        store.close(site)
+        store.close(page)
+    } catch {}
+
+    print("reopen closed tab")
+    do {
+        let tab = store.newTab(URL(string: "https://example.com/")!)
+        spin(20) { !tab.isLoading && tab.title == "Example Domain" }
+        tab.load(URL(string: "https://www.iana.org/help/example-domains")!)
+        spin(20) { !tab.isLoading && tab.url?.host == "www.iana.org" && tab.canGoBack }
+        store.close(tab)
+        store.reopenClosed()
+        let back = store.selected
+        back?.materialize()
+        spin(20) { back?.isLoading == false && back?.url?.host == "www.iana.org" && back?.canGoBack == true }
+        check("a tab brought back with Shift-Command-T can still go back", back?.url?.host == "www.iana.org" && back?.canGoBack == true)
+        back?.goBack()
+        spin(20) { back?.isLoading == false && back?.url?.host == "example.com" }
+        check("to the page it was on before", back?.url?.absoluteString == "https://example.com/")
+        if let back { store.close(back) }
     }
 
     print("session")

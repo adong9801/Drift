@@ -11,7 +11,7 @@ enum Address {
         guard !text.isEmpty, !text.contains(" ") else { return nil }
 
         let lowered = text.lowercased()
-        for scheme in ["http://", "https://", "file://", "about:"] where lowered.hasPrefix(scheme) {
+        for scheme in ["http://", "https://", "file://", "about:", "drift://"] where lowered.hasPrefix(scheme) {
             return URL(string: text)
         }
         // "foo:bar" with no slashes is a search, not a scheme, unless the part
@@ -66,6 +66,8 @@ enum Address {
     static func displayHost(_ url: URL?) -> String {
         guard let url else { return "" }
         guard let host = url.host else { return url.absoluteString }
+        // Drift's own pages say whose they are, as chrome://history does.
+        if url.scheme == "drift" { return "drift://\(host)" }
         return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
     }
 }

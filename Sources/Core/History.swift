@@ -5,6 +5,52 @@ struct HistoryEntry: Codable, Equatable {
     var title: String
     var lastVisit: Date
     var visits: Int
+    /// The last visit on each day the page was visited, oldest first: what
+    /// the History page lists, a page once per day, as Chrome's does.
+    var days: [Date] = []
+
+    /// At most this many days are kept for any one page.
+    static let dayLimit = 90
+
+    mutating func noteVisit(at now: Date, calendar: Calendar = .current) {
+        if let last = days.last, calendar.isDate(last, inSameDayAs: now) {
+            days[days.count - 1] = max(last, now)
+        } else {
+            days.append(now)
+            // A clock set back puts a day out of order.
+            if days.count > 1, days[days.count - 2] > now { days.sort() }
+        }
+        if days.count > Self.dayLimit { days.removeFirst(days.count - Self.dayLimit) }
+    }
+}
+
+extension HistoryEntry {
+    /// History saved before days were kept has the last visit alone.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        url = try container.decode(String.self, forKey: .url)
+        title = try container.decode(String.self, forKey: .title)
+        lastVisit = try container.decode(Date.self, forKey: .lastVisit)
+        visits = try container.decode(Int.self, forKey: .visits)
+        days = try container.decodeIfPresent([Date].self, forKey: .days) ?? [lastVisit]
+    }
+}
+
+/// One line on the History page: a page, on a day, at its last visit that day.
+struct HistoryVisit: Equatable {
+    let url: String
+    let title: String
+    let time: Date
+
+    /// The time to the millisecond, which is what the page is handed and
+    /// hands back, so a place in the list survives the trip both ways.
+    var stamp: Int64 { Self.stamp(time) }
+    static func stamp(_ time: Date) -> Int64 { Int64((time.timeIntervalSince1970 * 1000).rounded()) }
+
+    /// Newest first; the address settles a tie.
+    static func comesBefore(_ a: (stamp: Int64, url: String), _ b: (stamp: Int64, url: String)) -> Bool {
+        a.stamp != b.stamp ? a.stamp > b.stamp : a.url < b.url
+    }
 }
 
 /// Every page visited, one entry per URL. It exists to feed the command bar,
@@ -51,12 +97,13 @@ struct History: Codable, Equatable {
         if var existing = entries[key] {
             existing.visits += 1
             existing.lastVisit = now
+            existing.noteVisit(at: now)
             let retitled = !title.isEmpty && title != existing.title
             if retitled { existing.title = title }
             entries[key] = existing
             if retitled { reindex(existing) }
         } else {
-            let entry = HistoryEntry(url: key, title: title, lastVisit: now, visits: 1)
+            let entry = HistoryEntry(url: key, title: title, lastVisit: now, visits: 1, days: [now])
             entries[key] = entry
             reindex(entry)
             trim()
@@ -108,6 +155,65 @@ struct History: Codable, Equatable {
     mutating func forget(url: String) {
         entries[url] = nil
         index[url] = nil
+    }
+
+    // MARK: - The History page
+
+    /// Visits newest first, a page once a day, after `cursor` (the last one
+    /// the page already has) when given. Every word of `query` has to be in
+    /// the page's address or title.
+    func visits(matching query: String = "", after cursor: (stamp: Int64, url: String)? = nil, limit: Int) -> [HistoryVisit] {
+        let words = query.lowercased().split(separator: " ").map(String.init)
+        var found: [HistoryVisit] = []
+        for (url, entry) in entries {
+            if !words.isEmpty {
+                guard let searchable = index[url], words.allSatisfy(searchable.haystack.contains) else { continue }
+            }
+            for day in entry.days {
+                let visit = HistoryVisit(url: url, title: entry.title, time: day)
+                if let cursor, !HistoryVisit.comesBefore(cursor, (visit.stamp, url)) { continue }
+                found.append(visit)
+            }
+        }
+        found.sort { HistoryVisit.comesBefore(($0.stamp, $0.url), ($1.stamp, $1.url)) }
+        return Array(found.prefix(limit))
+    }
+
+    /// Takes the given visits out: for each, that page's day. A page left
+    /// with no days is gone altogether, so nothing offers it any more.
+    /// Returns the addresses that went entirely.
+    @discardableResult
+    mutating func remove(visits: [(url: String, time: Date)], calendar: Calendar = .current) -> [String] {
+        var gone: [String] = []
+        for visit in visits {
+            guard var entry = entries[visit.url] else { continue }
+            entry.days.removeAll { calendar.isDate($0, inSameDayAs: visit.time) }
+            if settle(&entry) { gone.append(visit.url) }
+        }
+        return gone
+    }
+
+    /// Takes out every visit from `start` on.
+    @discardableResult
+    mutating func remove(since start: Date) -> [String] {
+        var gone: [String] = []
+        for var entry in entries.values where entry.lastVisit >= start || entry.days.contains(where: { $0 >= start }) {
+            entry.days.removeAll { $0 >= start }
+            if settle(&entry) { gone.append(entry.url) }
+        }
+        return gone
+    }
+
+    /// Puts an entry back after some of its days went, or drops it if none
+    /// are left. Whether it was dropped.
+    private mutating func settle(_ entry: inout HistoryEntry) -> Bool {
+        guard let last = entry.days.last else {
+            forget(url: entry.url)
+            return true
+        }
+        entry.lastVisit = last
+        entries[entry.url] = entry
+        return false
     }
 
     // MARK: - Matching

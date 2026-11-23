@@ -19,10 +19,13 @@ struct InstalledExtension: Codable, Identifiable, Equatable {
     /// an extension is someone else's code with storage of its own, and what
     /// it noted down about a private tab would outlive the session.
     var allowedInPrivate: Bool?
-    /// Whether its button sits in the toolbar. Nil, as for every record saved
-    /// before this existed, means it does; unpinned, it is reached from the
-    /// extensions menu.
+    /// Whether its button is pinned to the toolbar. Unpinned, it is reached
+    /// from the extensions menu. One installed now starts unpinned, as in
+    /// Chrome, so the toolbar holds only what was chosen for it; nil, as for
+    /// every record saved before pinning could be chosen, means pinned, so
+    /// a toolbar already set up stays as it was.
     var pinned: Bool?
+    var isPinned: Bool { pinned != false }
 
     /// "canvas.school.edu, *.instructure.com" as match patterns, dropping
     /// anything that is not one.
@@ -275,9 +278,9 @@ final class Extensions: NSObject, ObservableObject {
             ?? name.flatMap { name in installed.first { self.name(of: $0) == name } }
     }
 
-    /// The ones whose buttons are in the toolbar.
+    /// The ones pinned to the toolbar.
     var toolbar: [InstalledExtension] {
-        actionable.filter { $0.pinned != false }
+        actionable.filter(\.isPinned)
     }
 
     func setPinned(_ record: InstalledExtension, _ pinned: Bool) {
@@ -373,7 +376,7 @@ final class Extensions: NSObject, ObservableObject {
         // storage, and swap the files underneath.
         let name = parsed.displayName
         let existing = installed.first { contexts[$0.id]?.webExtension.displayName == name && name != nil }
-        let record = existing ?? InstalledExtension(id: id, enabled: true, source: source)
+        let record = existing ?? InstalledExtension(id: id, enabled: true, source: source, pinned: false)
         if let existing { unload(existing.id) }
 
         let home = Self.folder.appendingPathComponent(record.id, isDirectory: true)
@@ -575,6 +578,12 @@ final class Extensions: NSObject, ObservableObject {
     /// The extensions button, which a popup hangs from when its own button
     /// is not in the toolbar.
     static let menuAnchor = "drift.extensions-button"
+
+    /// Where an extension's popup hangs from: its own button if pinned and
+    /// on screen, else the extensions button. Nil with neither showing.
+    func popupAnchor(for id: String) -> NSView? {
+        [id, Self.menuAnchor].lazy.compactMap { self.anchors[$0]?.view }.first { $0.window != nil }
+    }
 
     /// Closes the extension popup that is showing. False if none was, so the
     /// caller can go on to whatever Cmd-W would otherwise mean.
@@ -878,8 +887,10 @@ extension Extensions: WKWebExtensionControllerDelegate {
             }
         }
         // Off its own button if that is on screen, else the extensions button
-        // it was opened from, else the window's corner.
-        if let anchor = (anchors[context.uniqueIdentifier] ?? anchors[Self.menuAnchor])?.view, anchor.window != nil {
+        // it was opened from, else the window's corner. A button unpinned
+        // leaves its entry behind, gone or out of the window, so each is
+        // tried in turn rather than the first one found.
+        if let anchor = popupAnchor(for: context.uniqueIdentifier) {
             popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .maxY)
         } else if let content = NSApp.keyWindow?.contentView ?? NSApp.windows.first?.contentView {
             let corner = NSRect(x: 40, y: content.bounds.maxY - 40, width: 1, height: 1)

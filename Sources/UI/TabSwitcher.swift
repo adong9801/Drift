@@ -153,7 +153,7 @@ struct TabSwitcher: View {
             }
         }
         .onHover { inside in
-            if inside { store.hoverSwitcher(index) }
+            if inside { store.pointerEnteredSwitcherCard(index) }
         }
         .onTapGesture {
             store.hoverSwitcher(index)

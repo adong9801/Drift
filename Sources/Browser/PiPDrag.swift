@@ -70,22 +70,41 @@ final class PiPDrag {
     /// The press was on the window or just off its edge, where resizing
     /// starts: either way, where the window ends up is worth noting.
     nonisolated(unsafe) private static var shaping = false
+    /// Command was already down when the press came, held by the user.
+    nonisolated(unsafe) private static var userHoldsCommand = false
+    /// Drift is holding Command down for the drag under way.
+    nonisolated(unsafe) private static var holdingCommand = false
+    /// Drift's Command is still down, let go of in a moment.
+    nonisolated(unsafe) private static var releasing = false
 
     private static func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
         switch type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
             // The system switches a slow tap off; switch it back on.
             MainActor.assumeIsolated { if let tap = shared.tap { CGEvent.tapEnable(tap: tap, enable: true) } }
+            letGoOfCommand(after: 0)
             return Unmanaged.passUnretained(event)
         case .leftMouseDown:
+            letGoOfCommand(after: 0)
             dragging = isOverPictureInPicture(event.location)
             shaping = isOverPictureInPicture(event.location, margin: 8)
+            userHoldsCommand = event.flags.contains(.maskCommand) && !releasing
+        case .leftMouseDragged:
+            // Marking the events is not always enough: where the window lands
+            // is settled from the keyboard's own state once the drag ends, as
+            // with the move in `move(_:to:)`, so the key is held for real,
+            // from the first move until just after the button comes up.
+            if dragging, !userHoldsCommand, !holdingCommand {
+                holdingCommand = true
+                postCommand(down: true)
+            }
         default:
             break
         }
         if dragging { event.flags.insert(.maskCommand) }
         if type == .leftMouseUp {
             dragging = false
+            letGoOfCommand(after: 0.3)
             if shaping {
                 shaping = false
                 // Once the window has settled under the pointer.
@@ -97,16 +116,55 @@ final class PiPDrag {
         return Unmanaged.passUnretained(event)
     }
 
+    private static func letGoOfCommand(after delay: TimeInterval) {
+        guard holdingCommand else { return }
+        holdingCommand = false
+        guard delay > 0 else { postCommand(down: false); return }
+        releasing = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            releasing = false
+            // Unless another drag has taken the key up again meanwhile.
+            if !holdingCommand { postCommand(down: false) }
+        }
+    }
+
+    private static func postCommand(down: Bool) {
+        let event = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState), virtualKey: 0x37, keyDown: down)
+        event?.flags = down ? .maskCommand : []
+        event?.post(tap: .cghidEventTap)
+    }
+
     /// Whether the point is on the system's picture-in-picture window, or
     /// within `margin` of it.
-    private static func isOverPictureInPicture(_ point: CGPoint, margin: CGFloat = 0) -> Bool {
+    static func isOverPictureInPicture(_ point: CGPoint, margin: CGFloat = 0) -> Bool {
         guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
-        for window in windows where (window[kCGWindowOwnerName as String] as? String) == "PIPAgent" {
-            guard let bounds = window[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
-            let frame = CGRect(x: bounds["X"] ?? 0, y: bounds["Y"] ?? 0, width: bounds["Width"] ?? 0, height: bounds["Height"] ?? 0)
-            if frame.insetBy(dx: -margin, dy: -margin).contains(point) { return true }
+        return pictureInPictureWindows(in: windows).contains { $0.frame.insetBy(dx: -margin, dy: -margin).contains(point) }
+    }
+
+    /// The system's picture-in-picture windows among those listed. They are
+    /// its PIPAgent's, told by the process and not by the owner's name: that
+    /// is the agent's display name, "Picture in Picture", in the user's
+    /// language, and not "PIPAgent".
+    nonisolated static func pictureInPictureWindows(in windows: [[String: Any]], isAgent: (pid_t) -> Bool = isAgent) -> [(owner: pid_t, frame: CGRect)] {
+        var agents: [pid_t: Bool] = [:]
+        return windows.compactMap { window in
+            guard let owner = window[kCGWindowOwnerPID as String] as? pid_t,
+                  (window[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+                  let bounds = window[kCGWindowBounds as String] as? [String: CGFloat] else { return nil }
+            let agent = agents[owner] ?? isAgent(owner)
+            agents[owner] = agent
+            guard agent else { return nil }
+            return (owner, CGRect(x: bounds["X"] ?? 0, y: bounds["Y"] ?? 0, width: bounds["Width"] ?? 0, height: bounds["Height"] ?? 0))
         }
-        return false
+    }
+
+    /// Whether the process runs the system's picture-in-picture agent. Asked
+    /// afresh each time, since a process number is handed on once the agent,
+    /// which quits when no video is out, has gone.
+    nonisolated static func isAgent(_ pid: pid_t) -> Bool {
+        var path = [CChar](repeating: 0, count: 4096)
+        guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return false }
+        return String(cString: path).hasSuffix("/PIPAgent.app/Contents/MacOS/PIPAgent")
     }
 
     // MARK: - Where it was left
@@ -173,9 +231,11 @@ final class PiPDrag {
     }
 
     private static func pictureInPictureWindow() -> AXUIElement? {
-        guard let agent = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.PIPAgent").first else { return nil }
+        // The agent is found through its window, as for a drag.
+        guard let listed = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
+              let agent = pictureInPictureWindows(in: listed).first?.owner else { return nil }
         var windows: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(AXUIElementCreateApplication(agent.processIdentifier), kAXWindowsAttribute as CFString, &windows) == .success else { return nil }
+        guard AXUIElementCopyAttributeValue(AXUIElementCreateApplication(agent), kAXWindowsAttribute as CFString, &windows) == .success else { return nil }
         return (windows as? [AXUIElement])?.first
     }
 

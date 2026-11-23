@@ -19,7 +19,7 @@ enum TabSleep {
         let minutes = UserDefaults.standard.object(forKey: "drift.sleepMinutes.v1") as? Int ?? 10
         return TimeInterval(max(1, min(60, minutes))) * 60
     }
-    /// Under memory pressure from the system, this is long enough.
+    /// With the system about to run out of memory, this is long enough.
     static let pressureLimit: TimeInterval = 2 * 60
 
     /// What would be lost by sleeping the page, as far as can be told.

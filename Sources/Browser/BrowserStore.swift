@@ -71,9 +71,22 @@ final class BrowserStore: ObservableObject {
     }
 
     @Published private(set) var tabs: [Tab] = []
-    @Published private(set) var selectedID: UUID?
+    @Published private(set) var selectedID: UUID? {
+        didSet { wentOutOfSight(oldValue) }
+    }
     /// The tab in the right-hand pane, when the view is split.
-    @Published private(set) var splitID: UUID?
+    @Published private(set) var splitID: UUID? {
+        didSet { wentOutOfSight(oldValue) }
+    }
+
+    /// A tab's idle time, which decides when it sleeps, runs from when it
+    /// left the screen, by whatever way it left: another tab chosen, the
+    /// split closed, another tab put in the split. Without this, a tab sat in
+    /// for an hour beside another and then sent away was an hour idle at once.
+    private func wentOutOfSight(_ id: UUID?) {
+        guard let id, id != selectedID, id != splitID else { return }
+        tab(id)?.lastActive = Date()
+    }
     @Published var focusedPane: Pane = .primary
     @Published var splitRatio = 0.5
     @Published var sidebarVisible = true {
@@ -120,7 +133,10 @@ final class BrowserStore: ObservableObject {
     private var recent = RecentOrder<UUID>()
     /// Tabs opened behind and not yet visited, kept in line for Ctrl-Tab.
     private var queuedBehind: Set<UUID> = []
-    private var closed: [SavedTab] = []
+    /// Tabs closed, newest last, for Reopen Closed Tab: where each was, and
+    /// its back-forward list and scroll position, so a tab brought back can
+    /// still go back.
+    private var closed: [(saved: SavedTab, state: Any?)] = []
     private var sessionSave: DispatchWorkItem?
     private var historySave: DispatchWorkItem?
     private var historyDirty = false
@@ -169,19 +185,11 @@ final class BrowserStore: ObservableObject {
             MainActor.assumeIsolated { self?.sleepIdleTabs(olderThan: TabSleep.idleLimit) }
         }
         sleepTimer?.tolerance = 10
-        // The system saying it is short of memory is a strong signal — but a
-        // soft `.warning` is common and fires for the whole machine, not Drift,
-        // so it must not override a user who turned tab sleeping (and the memory
-        // budget) off: there it falls back to the normal rules, which do nothing
-        // when sleeping is off. A `.critical` is imminent exhaustion, where a
-        // crash would lose every tab, so there idle tabs are given back anyway.
         let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
         source.setEventHandler { [weak self] in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                FaviconCache.shared.trim()
-                let critical = self.memoryPressure?.data.contains(.critical) ?? false
-                self.sleepIdleTabs(olderThan: TabSleep.pressureLimit, force: critical)
+                self.memoryPressureChanged(critical: self.memoryPressure?.data.contains(.critical) ?? false)
             }
         }
         source.resume()
@@ -193,6 +201,23 @@ final class BrowserStore: ObservableObject {
         memoryPressure?.cancel()
         sessionSave?.cancel()
         historySave?.cancel()
+    }
+
+    /// The system saying memory is short. A `.warning` is common, comes a few
+    /// times an hour on a busy Mac, and is about the whole machine, not Drift;
+    /// the system copes by compressing memory, and WebKit already empties its
+    /// caches. So it only brings forward the usual check, with the user's own
+    /// wait: it used to put to sleep every tab left two minutes ago, which
+    /// looked like tabs sleeping for no reason. A `.critical` is the machine
+    /// about to run out, when a crash would lose every tab, so there tabs left
+    /// a couple of minutes ago go too, and even with sleeping turned off.
+    func memoryPressureChanged(critical: Bool) {
+        FaviconCache.shared.trim()
+        if critical {
+            sleepIdleTabs(olderThan: TabSleep.pressureLimit, force: true)
+        } else {
+            sleepIdleTabs(olderThan: TabSleep.idleLimit)
+        }
     }
 
     /// `force` is the menu command: it skips the clock, and the switch, but
@@ -584,11 +609,13 @@ final class BrowserStore: ObservableObject {
     // MARK: - Opening and closing
 
     @discardableResult
-    func newTab(_ url: URL, inBackground: Bool = false, pinned: Bool = false, isPrivate: Bool = false) -> Tab {
+    func newTab(_ url: URL, inBackground: Bool = false, pinned: Bool = false, isPrivate: Bool = false, title: String = "", state: Any? = nil) -> Tab {
         // Everything opened in the private window is private, whoever asks.
         let isPrivate = isPrivate || isPrivateWindow
-        let tab = Tab(url: url, isPinned: pinned && !isPrivate, isPrivate: isPrivate)
+        let tab = Tab(url: url, title: title, isPinned: pinned && !isPrivate, isPrivate: isPrivate)
         tab.store = self
+        // A tab coming back wakes into what it had, instead of loading afresh.
+        if let state { tab.wake(into: state) }
         insert(tab, after: focused)
         if inBackground {
             // Start it loading now; being off screen is no reason to wait.
@@ -704,14 +731,64 @@ final class BrowserStore: ObservableObject {
         presentExternalLink()
     }
 
+    /// Opens the main window again after it was closed while the private one
+    /// kept the app running. Set by the window's view, which can reach
+    /// SwiftUI's `openWindow`.
+    static var reopenMainWindow: (() -> Void)?
+
     private func presentExternalLink() {
-        guard needsExternalPresentation, window != nil else { return }
+        guard needsExternalPresentation, let window else { return }
         needsExternalPresentation = false
+        // Closed, not just out of sight: SwiftUI used to bring it back for a
+        // link on its own, and no longer handles links (see DriftApp).
+        if !isPrivateWindow, !window.isVisible, !window.isMiniaturized { Self.reopenMainWindow?() }
         surfaceWindow()
         NSApp.activate(ignoringOtherApps: true)
         // Activation may switch Spaces on its own; only after that has had
         // its chance is the window fetched to where the user is looking.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in self?.surfaceWindow(fetching: true) }
+    }
+
+    /// Whether a Drift window the user could be looking at is on the Space
+    /// in front: a browser window, settings, the extensions panel. Not the
+    /// picture-in-picture window, which is on every Space and so says nothing
+    /// about where the browser is. Counting it left Cmd-Tab to Drift, with a
+    /// video in picture in picture, on the other app's Space.
+    static var windowInSight: Bool {
+        NSApp.windows.contains {
+            $0.isVisible && $0.isOnActiveSpace && !$0.isMiniaturized && $0.contentView != nil
+                && $0.frame.width > 200 && !isOnEverySpace($0)
+        }
+    }
+
+    /// The picture-in-picture panel, or any window that follows the user
+    /// from Space to Space.
+    static func isOnEverySpace(_ window: NSWindow) -> Bool {
+        window.collectionBehavior.contains(.canJoinAllSpaces) || window.className.hasPrefix("PIP")
+    }
+
+    /// Whether the pointer is on the picture-in-picture window, whichever
+    /// process draws it.
+    static var pointerOnPictureInPicture: Bool {
+        let inside = NSApp.windows.contains {
+            isOnEverySpace($0) && $0.isVisible && $0.frame.contains(NSEvent.mouseLocation)
+        }
+        return inside || CGEvent(source: nil).map { PiPDrag.isOverPictureInPicture($0.location) } == true
+    }
+
+    /// Drift was brought forward, by Cmd-Tab or the Dock, and none of its
+    /// windows is in sight. The window is gone to, on its own Space, as
+    /// macOS does when it switches to an app: ordering it in front from an
+    /// active app takes the screen there. The system had not, because the
+    /// picture-in-picture window was already here. If that does not happen
+    /// either, the window is fetched to where the user is looking.
+    func bringIntoSight() {
+        surfaceWindow()
+        // Long enough for the slide to the other Space to finish.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard NSApp.isActive, !Self.windowInSight else { return }
+            self?.surfaceWindow(fetching: true)
+        }
     }
 
     /// Makes sure the window can actually be seen: un-minimised, on a screen
@@ -751,11 +828,6 @@ final class BrowserStore: ObservableObject {
 
     func close(_ tab: Tab) {
         guard let index = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
-        // A private tab cannot be reopened: remembering it would be the leak.
-        if !tab.isPrivate, let url = tab.url {
-            closed.append(SavedTab(id: tab.id, url: url.absoluteString, title: tab.title, pinned: tab.isPinned, group: tab.groupID))
-            if closed.count > 25 { closed.removeFirst() }
-        }
         tabs.remove(at: index)
         recent.remove(tab.id)
         queuedBehind.remove(tab.id)
@@ -770,6 +842,12 @@ final class BrowserStore: ObservableObject {
             }
         }
         tab.sleep()
+        // A private tab cannot be reopened: remembering it would be the leak.
+        // Asleep now, it holds what it needs to come back as it was.
+        if !tab.isPrivate, let url = tab.url {
+            closed.append((SavedTab(id: tab.id, url: url.absoluteString, title: tab.title, pinned: tab.isPinned, group: tab.groupID), tab.sleepingState))
+            if closed.count > 25 { closed.removeFirst() }
+        }
 
         // Whether closing this tab hands the screen to a different one, which
         // should then pull its video back out of Picture in Picture.
@@ -805,8 +883,10 @@ final class BrowserStore: ObservableObject {
     }
 
     func reopenClosed() {
-        guard let last = closed.popLast(), let url = last.url.flatMap(URL.init(string:)) else { return }
-        let tab = newTab(url, pinned: last.pinned)
+        guard let entry = closed.popLast(), let url = entry.saved.url.flatMap(URL.init(string:)) else { return }
+        let last = entry.saved
+        // With the pages it went through, so Back works in it as before.
+        let tab = newTab(url, pinned: last.pinned, title: last.title, state: entry.state)
         // Back into its group, if the group is still there.
         if let group = last.group, self.group(group) != nil { add(tab, to: group) }
     }
@@ -929,6 +1009,7 @@ final class BrowserStore: ObservableObject {
     // MARK: - Ctrl-Tab
 
     func advanceSwitcher(backwards: Bool) {
+        notePointer()
         if var open = switcher {
             open.index = SwitcherGrid.step(from: open.index, count: open.entries.count, backwards: backwards)
             switcher = open
@@ -958,8 +1039,26 @@ final class BrowserStore: ObservableObject {
         )
     }
 
-    /// The pointer over a card in the overlay: that becomes the highlighted
-    /// one, so letting go of Control lands there.
+    /// Where the pointer was at the last key in the overlay, or when it came
+    /// up. A card that slides under a still pointer, as the overlay opens or
+    /// scrolls to follow the keys, is not one the pointer went to.
+    private var switcherPointer: CGPoint?
+    /// Where the pointer is; a test sets its own.
+    static var pointerLocation: () -> CGPoint = { NSEvent.mouseLocation }
+
+    private func notePointer() { switcherPointer = Self.pointerLocation() }
+
+    /// The pointer came onto a card in the overlay: that becomes the
+    /// highlighted one, but only if the pointer moved there.
+    func pointerEnteredSwitcherCard(_ index: Int) {
+        let now = Self.pointerLocation()
+        guard now != switcherPointer else { return }
+        switcherPointer = now
+        hoverSwitcher(index)
+    }
+
+    /// A card in the overlay picked by the pointer: that becomes the
+    /// highlighted one, so letting go of Control lands there.
     func hoverSwitcher(_ index: Int) {
         guard var open = switcher, open.entries.indices.contains(index), open.index != index else { return }
         open.index = index
@@ -968,6 +1067,7 @@ final class BrowserStore: ObservableObject {
 
     /// Up and Down in the overlay: a row at a time.
     func moveSwitcherRow(down: Bool) {
+        notePointer()
         guard var open = switcher else { return }
         open.index = SwitcherGrid.jumpRow(from: open.index, rowLengths: SwitcherLayout.rowLengths(open.sections), down: down)
         switcher = open
@@ -978,6 +1078,7 @@ final class BrowserStore: ObservableObject {
     /// highlight moves to whatever slides into the gap. A stack is a whole
     /// group, too much for one key; W leaves it be.
     func closeSwitcherSelection() {
+        notePointer()
         guard var open = switcher, let id = open.litTab else {
             if switcher?.lit != nil { NSSound.beep() }
             return
@@ -996,6 +1097,7 @@ final class BrowserStore: ObservableObject {
     /// group of the lit tab folds back into a stack. The same switch as the
     /// group's arrow in the sidebar.
     func toggleSwitcherGroup() {
+        notePointer()
         guard var open = switcher, let lit = open.lit else { return }
         let groupID: UUID?
         let opening: Bool
@@ -1059,7 +1161,43 @@ final class BrowserStore: ObservableObject {
         historyChanged()
     }
 
+    /// The History page's Remove: those pages on those days. A page with no
+    /// visits left is no longer offered in the command bar either.
+    func removeVisits(_ visits: [(url: String, time: Date)]) {
+        guard !isPrivateWindow else { return }
+        forgetShortcuts(to: history.remove(visits: visits))
+        historyChanged()
+    }
+
+    /// The History page's Clear: everything since `start`, or all of it.
+    func clearHistory(since start: Date?) {
+        guard !isPrivateWindow else { return }
+        guard let start else { return clearHistory() }
+        forgetShortcuts(to: history.remove(since: start))
+        historyChanged()
+    }
+
+    private func forgetShortcuts(to urls: [String]) {
+        guard !urls.isEmpty else { return }
+        for url in urls { shortcuts.forget(url: url) }
+        Storage.save(shortcuts, to: "shortcuts.json")
+        objectWillChange.send()
+    }
+
+    /// Command-Y: the History page, the one already open in this window if
+    /// there is one, as Chrome has it.
+    func showHistory() {
+        commandBar = nil
+        cancelSwitcher()
+        if let open = tabs.first(where: { HistoryPage.isPage($0.url) }) {
+            select(open)
+        } else {
+            newTab(HistoryPage.url)
+        }
+    }
+
     private func historyChanged() {
+        HistoryPage.version += 1
         historyDirty = true
         historySave?.cancel()
         let work = DispatchWorkItem { [weak self] in
@@ -1068,6 +1206,7 @@ final class BrowserStore: ObservableObject {
                 Storage.saveAsync(self.history, to: "history.json")
                 self.historyDirty = false
             }
+            if !self.isPrivateWindow { HistoryMenu.shared.refresh(from: self.history) }
         }
         historySave = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)

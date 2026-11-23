@@ -2,8 +2,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
 
-/// The extensions' buttons, and the puzzle piece that opens the manager. Sits
-/// at the foot of the sidebar, or in the top bar when the sidebar is hidden.
+/// The pinned extensions' buttons, and the puzzle piece that opens the
+/// manager. Sits in the top bar, which is there when the sidebar is hidden.
 struct ExtensionBar: View {
     @ObservedObject var extensions = Extensions.shared
     /// What to draw the icons in. The top bar passes the page's ink.
@@ -80,7 +80,7 @@ private struct ExtensionButton: View {
             if extensions.context(record.id)?.optionsPageURL != nil {
                 Button("Options") { extensions.openOptions(record) }
             }
-            Button("Hide from Toolbar") { extensions.setPinned(record, false) }
+            Button("Unpin") { extensions.setPinned(record, false) }
             Button("Turn Off") { extensions.setEnabled(record, false) }
         }
     }
@@ -105,9 +105,9 @@ private struct PopoverAnchor: NSViewRepresentable {
 
 /// The extensions menu: one row for each extension, on top the ones that are
 /// on, and the ways to install more behind the plus. A row opens its
-/// extension; the pin puts its button in the toolbar or takes it out; the
-/// switch turns it on and off; the rest (options, where it may run, private
-/// windows, removing it) is in the row's "…" menu.
+/// extension; the pin pins its button to the toolbar or unpins it, and is in
+/// the row's "…" menu too; the switch turns it on and off; the rest
+/// (options, where it may run, private windows, removing it) is in the "…".
 struct ExtensionManager: View {
     @ObservedObject var extensions: Extensions
     /// Puts the menu away, so that a popup opened from it is not left
@@ -353,15 +353,18 @@ private struct ExtensionRow: View {
             ].compactMap { $0 }.joined(separator: "\n"))
 
             if hasPopup {
-                Button { extensions.setPinned(record, record.pinned == false) } label: {
-                    Image(systemName: record.pinned == false ? "pin" : "pin.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(record.pinned == false ? Design.tertiary : Design.accent)
-                        .frame(width: 22, height: 22)
+                // As in Chrome: an outline to pin, filled once pinned.
+                Button { extensions.setPinned(record, !record.isPinned) } label: {
+                    Image(systemName: record.isPinned ? "pin.fill" : "pin")
+                        .font(.system(size: 13, weight: .medium))
+                        .rotationEffect(.degrees(45))
+                        .foregroundStyle(record.isPinned ? Design.accent : Design.secondary)
+                        .frame(width: 26, height: 24)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help(record.pinned == false ? "Show in Toolbar" : "Hide from Toolbar")
+                .hoverHighlight()
+                .help(record.isPinned ? "Unpin from Toolbar" : "Pin to Toolbar")
             }
 
             Toggle("", isOn: Binding(
@@ -376,6 +379,12 @@ private struct ExtensionRow: View {
             Menu {
                 if hasOptions {
                     Button("Options") { extensions.openOptions(record) }
+                }
+                if hasPopup {
+                    Toggle("Pin to Toolbar", isOn: Binding(
+                        get: { record.isPinned },
+                        set: { extensions.setPinned(record, $0) }
+                    ))
                 }
                 if extensions.asksForEverySite(record) {
                     Section("Runs on") {

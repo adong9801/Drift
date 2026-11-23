@@ -11,6 +11,12 @@ struct DriftApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1360, height: 880)
+        // Links from other apps are the app delegate's, and SwiftUI is told
+        // to keep out of them. Left to it, every link closed this window and
+        // opened it again before the delegate heard of it, and a window that
+        // closes leaves full screen, so a link clicked in Discord or Terminal
+        // brought Drift back out of full screen on the desktop.
+        .handlesExternalEvents(matching: [])
         .commands { BrowserCommands() }
 
         // Private browsing gets a window to itself. It is opened from the File
@@ -22,6 +28,8 @@ struct DriftApp: App {
         .defaultSize(width: 1200, height: 800)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
+        // Nor this one: closing it is what ends the private session.
+        .handlesExternalEvents(matching: [])
 
         Settings {
             SettingsView()
@@ -78,20 +86,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             BrowserStore.all.forEach { $0.applicationActiveChanged(true) }
             // Access may have been granted in System Settings in the meantime.
             PiPDrag.shared.startIfWanted()
-            // A click on the Dock icon that brings the app forward but shows no
-            // window: the window is on another Space the system chose not to
-            // switch to, or off any screen. Given a moment for the system's
-            // own Space switch, if that did not happen the window comes here.
+            // Cmd-Tab or the Dock bringing the app forward but showing no
+            // window: the window is on another Space the system did not
+            // switch to, since the picture-in-picture window was already
+            // here, or it is off any screen. Given a moment for the system's
+            // own Space switch, if that did not happen Drift goes to it.
+            // Not for a click on the picture-in-picture window itself, which
+            // is a pause or a drag and wants to stay where it is.
+            let onPictureInPicture = BrowserStore.pointerOnPictureInPicture
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                guard NSApp.isActive else { return }
                 // The plain question: is there any Drift window the user can
                 // actually see? A window can be key and main and still be on
                 // another Space, which is what "active, but no window" was.
-                let inSight = NSApp.windows.contains {
-                    $0.isVisible && $0.isOnActiveSpace && !$0.isMiniaturized && $0.contentView != nil && $0.frame.width > 200
-                }
-                guard !inSight else { return }
-                BrowserStore.shared.surfaceWindow(fetching: true)
+                guard NSApp.isActive, !onPictureInPicture, !BrowserStore.windowInSight else { return }
+                BrowserStore.shared.bringIntoSight()
             }
         }
     }
@@ -113,6 +121,7 @@ struct BrowserCommands: Commands {
     /// The menu bar speaks to whichever window is in front.
     @ObservedObject private var router = WindowRouter.shared
     @ObservedObject private var extensions = Extensions.shared
+    @ObservedObject private var historyMenu = HistoryMenu.shared
     @Environment(\.openWindow) private var openWindow
 
     private var store: BrowserStore { router.active }
@@ -216,11 +225,16 @@ struct BrowserCommands: Commands {
                 .keyboardShortcut("[")
             Button("Forward") { store.focused?.goForward() }
                 .keyboardShortcut("]")
+            // Every page, by day, searchable: the History page, as in Chrome.
+            Button("Show Full History") { store.showHistory() }
+                .keyboardShortcut("y")
             Divider()
-            // The latest pages, newest first. The command bar searches all of it.
-            ForEach(BrowserStore.shared.history.recent(limit: 15), id: \.url) { entry in
-                Button(entry.title.isEmpty ? entry.url : String(entry.title.prefix(60))) {
-                    if let url = URL(string: entry.url) { store.newTab(url) }
+            // The latest pages, newest first. The History page has the rest.
+            Section("Recently Visited") {
+                ForEach(historyMenu.recent, id: \.url) { entry in
+                    Button(entry.title.isEmpty ? entry.url : String(entry.title.prefix(60))) {
+                        if let url = URL(string: entry.url) { store.newTab(url) }
+                    }
                 }
             }
             Divider()
@@ -234,7 +248,18 @@ struct BrowserCommands: Commands {
             ForEach(extensions.actionable) { record in
                 Button(extensions.name(of: record)) { extensions.perform(record) }
             }
-            if !extensions.actionable.isEmpty { Divider() }
+            if !extensions.actionable.isEmpty {
+                Divider()
+                // Which buttons the top bar shows when the sidebar is away.
+                Menu("Pin to Toolbar") {
+                    ForEach(extensions.actionable) { record in
+                        Toggle(extensions.name(of: record), isOn: Binding(
+                            get: { record.isPinned },
+                            set: { extensions.setPinned(record, $0) }
+                        ))
+                    }
+                }
+            }
             Button("Manage Extensions\u{2026}") { ExtensionManagerPanel.show() }
         }
         CommandMenu("Tabs") {

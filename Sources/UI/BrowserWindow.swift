@@ -7,6 +7,7 @@ struct BrowserWindow: View {
     @ObservedObject var store: BrowserStore
     @ObservedObject var extensions = Extensions.shared
     @ObservedObject private var quit = QuitHold.shared
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -118,6 +119,7 @@ struct BrowserWindow: View {
         .ignoresSafeArea()
         .background { WindowButtons(store: store) }
         .frame(minWidth: 760, minHeight: 480)
+        .onAppear { [openWindow] in BrowserStore.reopenMainWindow = { openWindow(id: "browser") } }
     }
 
     // MARK: - Pages

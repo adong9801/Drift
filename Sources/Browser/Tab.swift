@@ -71,7 +71,8 @@ final class Tab: NSObject, ObservableObject, Identifiable {
         self.isPinned = isPinned
         self.isPrivate = isPrivate
         super.init()
-        if let host = url?.host { favicon = FaviconCache.shared.cached(host: host) }
+        if HistoryPage.isPage(url) { favicon = HistoryPage.icon }
+        else if let host = url?.host { favicon = FaviconCache.shared.cached(host: host) }
     }
 
     var displayTitle: String {
@@ -113,6 +114,8 @@ final class Tab: NSObject, ObservableObject, Identifiable {
         scripts.add(TabFullscreenBridge.shared, contentWorld: Self.ownWorld, name: "driftFullscreen")
         scripts.removeScriptMessageHandler(forName: "driftPiP", contentWorld: Self.ownWorld)
         scripts.add(TabPiPBridge.shared, contentWorld: Self.ownWorld, name: "driftPiP")
+        scripts.removeScriptMessageHandler(forName: "driftHistory", contentWorld: Self.ownWorld)
+        scripts.addScriptMessageHandler(HistoryBridge.shared, contentWorld: Self.ownWorld, name: "driftHistory")
         view.tab = self
         // What shows before the page has painted, and behind any page with
         // no background of its own: the window's colour, so a page waking in
@@ -170,6 +173,14 @@ final class Tab: NSObject, ObservableObject, Identifiable {
         }
         Self.turnOffWebGPU(configuration.preferences)
         Self.setFeature(SteadyScrolling.feature, on: SteadyScrolling.enabled, in: configuration.preferences)
+        // drift://history, the History page, and what runs it; see HistoryPage.
+        configuration.setURLSchemeHandler(HistorySchemeHandler.shared, forURLScheme: HistoryPage.scheme)
+        configuration.userContentController.addUserScript(WKUserScript(
+            source: HistoryPage.script,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true,
+            in: Self.ownWorld
+        ))
         // In a world of its own, where the page's scripts cannot reach it.
         configuration.userContentController.addUserScript(WKUserScript(
             source: TabSleep.tracker,
@@ -224,6 +235,13 @@ final class Tab: NSObject, ObservableObject, Identifiable {
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false,
             in: Self.ownWorld
+        ))
+        // YouTube kept to MP4 video, which WebKit plays; see YouTubeFormats.
+        configuration.userContentController.addUserScript(WKUserScript(
+            source: YouTubeFormats.script,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false,
+            in: .page
         ))
         // Full screen kept inside the window; see PageFullscreen.
         configuration.userContentController.addUserScript(WKUserScript(
@@ -508,6 +526,17 @@ final class Tab: NSObject, ObservableObject, Identifiable {
         }
     }
 
+    /// What a tab asleep will wake into: its back-forward list and scroll
+    /// position. Nil for one not opened since launch.
+    var sleepingState: Any? { savedState }
+
+    /// Has a tab not yet opened wake into what another one had, as a closed
+    /// tab brought back does.
+    func wake(into state: Any) {
+        guard webView == nil else { return }
+        savedState = state
+    }
+
     /// Frees the web process. The row, address and thumbnail stay, and so does
     /// enough to put the page back as it was.
     func sleep() {
@@ -573,6 +602,11 @@ final class Tab: NSObject, ObservableObject, Identifiable {
     }
 
     private func loadFavicon() {
+        if HistoryPage.isPage(webView?.url) {
+            favicon = HistoryPage.icon
+            faviconHost = nil
+            return
+        }
         guard let webView, let page = webView.url, let host = page.host, host != faviconHost else { return }
         faviconHost = host
         if let cached = FaviconCache.shared.cached(host: host) { favicon = cached }
@@ -716,6 +750,12 @@ final class PageView: WKWebView {
     private var lastDragAnswer: NSDragOperation?
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        // Files already on disk go in as files, not as a promise; see FileDrop.
+        if let drop = FileDrop.alreadyWritten(sender) {
+            let done = super.performDragOperation(drop)
+            tab?.note("drag", "AppKit dropped \(drop.files.count) file(s) another app had already written; WebKit was handed copies of them rather than the app's promise, and \(done ? "took" : "refused") the drop")
+            return done
+        }
         let done = super.performDragOperation(sender)
         tab?.note("drag", "AppKit dropped it on the page; WebKit \(done ? "took" : "refused") the drop")
         return done
@@ -751,6 +791,7 @@ final class PageView: WKWebView {
 
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
         super.willOpenMenu(menu, with: event)
+        CopyImage.adopt(menu)
         guard let tab else { return }
         let items = Extensions.shared.menuItems(for: tab)
         guard !items.isEmpty else { return }
@@ -910,8 +951,14 @@ extension Tab: WKNavigationDelegate {
         // fotmob://postrender); with no app for it, macOS would put up an
         // error, so such a link just goes nowhere.
         let scheme = destination.scheme?.lowercased() ?? ""
+        // The History page, where this web view can show it. An extension's
+        // own page cannot, and hands it to a tab of its own.
+        if scheme == HistoryPage.scheme, webView.configuration.urlSchemeHandler(forURLScheme: scheme) == nil {
+            store?.newTab(destination, isPrivate: isPrivate)
+            return decisionHandler(.cancel, preferences)
+        }
         let isExtensionPage = Extensions.shared.controller.extensionContext(for: destination) != nil
-        if !isExtensionPage, !["http", "https", "about", "file", "blob", "data", "javascript"].contains(scheme) {
+        if !isExtensionPage, !["http", "https", "about", "file", "blob", "data", "javascript", HistoryPage.scheme].contains(scheme) {
             if NSWorkspace.shared.urlForApplication(toOpen: destination) != nil {
                 NSWorkspace.shared.open(destination)
             } else {
@@ -1252,6 +1299,11 @@ final class FaviconCache {
 
     private func file(for host: String) -> URL {
         folder.appendingPathComponent(host.replacingOccurrences(of: "/", with: "_"))
+    }
+
+    /// The icon as kept on disk, a PNG, for the History page.
+    func storedData(host: String) -> Data? {
+        try? Data(contentsOf: file(for: host))
     }
 
     func cached(host: String) -> NSImage? {
